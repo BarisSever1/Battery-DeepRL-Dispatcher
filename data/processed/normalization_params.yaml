@@ -1,0 +1,67 @@
+normalization:
+  method: minmax
+  target_range:
+  - -1
+  - 1
+  formula: 2 * (value - min) / (max - min) - 1
+features:
+  k:
+    min: 0.0
+    max: 23.0
+    range: 23.0
+  weekday:
+    min: 0.0
+    max: 6.0
+    range: 6.0
+  season:
+    min: 0.0
+    max: 3.0
+    range: 3.0
+  price_em:
+    min: -83.29
+    max: 247.35
+    range: 330.64
+  price_as:
+    min: 0.8
+    max: 13.81754183931486
+    range: 13.017541839314859
+  p_res_total:
+    min: 0.0
+    max: 20.0
+    range: 20.0
+  price_em_max_morning:
+    min: 5.19
+    max: 175.51
+    range: 170.32
+  price_em_max_evening:
+    min: 77.15
+    max: 247.35
+    range: 170.2
+  k_em_max_morning:
+    min: 0.0
+    max: 11.0
+    range: 11.0
+  k_em_max_evening:
+    min: 16.0
+    max: 21.0
+    range: 5.0
+  price_em_min:
+    min: -83.29
+    max: 85.81
+    range: 169.10000000000002
+  k_em_min:
+    min: 2.0
+    max: 23.0
+    range: 21.0
+  price_as_min:
+    min: 0.8
+    max: 1.1710745448672317
+    range: 0.3710745448672317
+  price_as_max:
+    min: 2.150756661127138
+    max: 13.81754183931486
+    range: 11.666785178187721
+  time_to_peak_hour:
+    min: 0.0
+    max: 21.0
+    range: 21.0

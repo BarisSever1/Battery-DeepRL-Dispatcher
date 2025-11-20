@@ -1,0 +1,504 @@
+"""Training entry point for TD3 + LSTM agent on the BESS environment."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import numpy as np
+import yaml
+import torch
+from gymnasium.utils import seeding
+
+from src.envs import BESSEnv
+from src.rl.buffer import ReplayBuffer
+from src.rl.td3 import TD3Agent, TD3Config
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train TD3+LSTM agent on BESSEnv")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--days-per-epoch", type=int, default=20, help="Episodes per epoch")
+    parser.add_argument("--warmup-steps", type=int, default=5000, help="Warmup steps with random actions")
+    parser.add_argument("--buffer-size", type=int, default=200_000, help="Replay buffer capacity")
+    parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size for updates")
+    parser.add_argument("--updates-per-step", type=int, default=1, help="Gradient updates per environment step")
+    parser.add_argument("--seq-len", type=int, default=24, help="Sequence length sampled from replay buffer")
+    parser.add_argument("--exploration-std", type=float, default=0.5, help="Std dev of exploration noise")
+    parser.add_argument("--target-std", type=float, default=0.5, help="Std dev of target policy smoothing noise")
+    parser.add_argument("--noise-clip", type=float, default=0.4, help="Clamp for target policy smoothing noise")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--tau", type=float, default=0.01, help="Polyak averaging factor")
+    parser.add_argument("--policy-delay", type=int, default=2, help="Delayed policy update interval")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for actor/critic")
+    parser.add_argument("--actor-lr", type=float, default=None, help="Optional override for actor learning rate")
+    parser.add_argument("--critic-lr", type=float, default=None, help="Optional override for critic learning rate")
+    parser.add_argument("--device", type=str, default="auto", help="Training device: auto|cpu|cuda")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--log-interval", type=int, default=10, help="Print metrics every N episodes")
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"), help="Directory for model checkpoints")
+    parser.add_argument("--checkpoint-interval", type=int, default=100, help="Episodes between checkpoints")
+    parser.add_argument("--csv-log", type=Path, default=None, help="Optional path to append episode metrics CSV")
+    parser.add_argument("--eval-mode", action="store_true", help="Disable exploration noise during training (debug)")
+    parser.add_argument(
+        "--degradation-model",
+        type=str,
+        default="nonlinear",
+        choices=["nonlinear", "linear"],
+        help="Degradation cost model used by the environment.",
+    )
+    parser.add_argument(
+        "--quick-eval-interval",
+        type=int,
+        default=0,
+        help="Run a 1-day rollout every N episodes and save hourly CSV (0=off)",
+    )
+    parser.add_argument(
+        "--quick-eval-date",
+        type=str,
+        default=None,
+        help="YYYY-MM-DD date to rollout (required if --quick-eval-interval>0)",
+    )
+    parser.add_argument(
+        "--quick-eval-outdir",
+        type=Path,
+        default=Path("results/quick"),
+        help="Directory to save quick hourly rollout CSVs",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="data/processed/training_features_normalized_train.parquet",
+        help="Path to training data parquet file",
+    )
+    return parser.parse_args()
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_arg)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compute_action_mask(env: BESSEnv) -> Optional[Tuple[float, float]]:
+    """Infer (low, high) action bounds from the environment's current peak window."""
+    hour = getattr(env, "current_hour", None)
+    if hour is None:
+        return None
+
+    def _to_set(hours):
+        if hours is None:
+            return set()
+        if isinstance(hours, set):
+            return hours
+        return set(hours)
+
+    morning_hours = _to_set(getattr(env, "morning_peak_hours", None))
+    evening_hours = _to_set(getattr(env, "evening_peak_hours", None))
+
+    if not morning_hours and not evening_hours:
+        return None
+
+    in_peak = (hour in morning_hours) or (hour in evening_hours)
+    return (0.0, 1.0) if in_peak else (-1.0, 0.0)
+
+
+class CSVWriter:
+    """Wrapper for csv.writer that holds the file reference."""
+    def __init__(self, writer: csv.writer, file):
+        self.writer = writer
+        self.file = file
+    
+    def writerow(self, row):
+        return self.writer.writerow(row)
+
+
+def initialize_csv(path: Path) -> Optional[CSVWriter]:
+    if path is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists()
+    csv_file = path.open("a", newline="")
+    writer = csv.writer(csv_file)
+    if not file_exists:
+        writer.writerow(
+            [
+                "episode",
+                "return",
+                "episode_profit",
+                "episode_revenue",
+                "episode_degradation",
+                "rev_pv",
+                "rev_energy",
+                "rev_reserve",
+                "deg_cost",
+            ]
+        )
+    return CSVWriter(writer, csv_file)
+
+
+def close_csv(writer: Optional[CSVWriter]) -> None:
+    if writer is not None:
+        writer.file.close()
+
+
+def _denorm_obs_features(env: BESSEnv, obs_vec: np.ndarray, soc_before: float) -> Dict[str, float]:
+    """Denormalize core features for CSV output (mirrors eval script semantics)."""
+    feature_names = [
+        "k", "weekday", "season", "price_em", "price_as", "p_res_total",
+        "soc", "dod", "price_em_max_morning", "price_em_max_evening",
+        "k_em_max_morning", "k_em_max_evening", "price_em_min", "k_em_min",
+        "price_as_min", "price_as_max",
+        "time_to_peak_hour",
+    ]
+    out: Dict[str, float] = {}
+    for i, name in enumerate(feature_names):
+        val = float(obs_vec[i])
+        if name == "soc":
+            out["soc_raw"] = soc_before
+        elif name == "dod":
+            # We don't track live DOD here; restore from normalized as a proxy
+            out["dod_raw"] = (val + 1.0) / 2.0
+        else:
+            raw = env._denormalize(name, val)
+            if name == "price_em":
+                out["price_em_raw"] = raw
+            elif name == "price_as":
+                out["price_as_raw"] = raw
+            elif name == "p_res_total":
+                out["p_res_total_raw"] = raw
+            else:
+                out[name] = raw
+    return out
+
+
+def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict[str, float]]:
+    """Run a single-day deterministic rollout, return hourly rows (like eval)."""
+    import numpy as _np
+    rows: List[Dict[str, float]] = []
+    obs, _ = env.reset(options={"date": _np.datetime64(rollout_date).astype("datetime64[D]").astype(object)})
+    obs_vec = _np.asarray(obs, dtype=_np.float32)
+    obs_history: List[_np.ndarray] = []
+    done = False
+    step = 0
+    totals = {"revenue_pv": 0.0, "revenue_energy": 0.0, "revenue_reserve": 0.0, "degradation": 0.0}
+
+    history_len = 24
+    while not done:
+        # RL clean-up patch: keep fixed-length history (24)
+        obs_history.append(obs_vec)
+        if len(obs_history) > history_len:
+            obs_history.pop(0)
+        state_seq = _np.asarray(obs_history, dtype=_np.float32)[_np.newaxis, :, :]  # [1,T,F]
+        mask = compute_action_mask(env)
+        action_seq = agent.act(state_seq, eval_mode=True, action_mask=mask)
+        action = float(action_seq[0, -1, 0])
+
+        next_obs, reward, terminated, truncated, info = env.step(_np.array([action], dtype=_np.float32))
+
+        soc = float(info.get("soc", env.soc))
+        soc_before = float(info.get("soc_before", env.soc))
+
+        # Cumulative trackers
+        totals["revenue_pv"] += info.get("revenue_pv_grid", 0.0)
+        totals["revenue_energy"] += info.get("revenue_energy", 0.0)
+        totals["revenue_reserve"] += info.get("revenue_reserve", 0.0)
+        totals["degradation"] += info.get("cost_degradation", 0.0)
+        cumulative_revenue = totals["revenue_pv"] + totals["revenue_energy"] + totals["revenue_reserve"]
+        cumulative_degradation = totals["degradation"]
+        cumulative_profit = cumulative_revenue - cumulative_degradation
+
+        # Denormalized feature snapshot
+        obs_features = _denorm_obs_features(env, obs_vec, soc_before)
+
+        rows.append({
+            "hour": info.get("hour", step),
+            "action": action,
+            "delta": float(info.get("delta", action)),
+            "soc": soc,
+            "soc_before": soc_before,
+            "dod_morning": float(info.get("dod_morning", 0.0)),
+            "dod_evening": float(info.get("dod_evening", 0.0)),
+            "p_battery": float(info.get("p_battery", 0.0)),
+            "p_pv_raw": float(info.get("p_pv_raw", 0.0)),
+            "p_pv_grid": float(info.get("p_pv_grid", 0.0)),
+            "p_bess_em": float(info.get("p_bess_em", 0.0)),
+            "p_reserve": float(info.get("p_reserve", 0.0)),
+            "price_em": float(info.get("price_em", 0.0)),
+            "price_as": float(info.get("price_as", 0.0)),
+            "revenue_pv": float(info.get("revenue_pv_grid", 0.0)),
+            "revenue_energy": float(info.get("revenue_energy", 0.0)),
+            "revenue_reserve": float(info.get("revenue_reserve", 0.0)),
+            "degradation_cost": float(info.get("cost_degradation", 0.0)),
+            "reward": float(reward),
+            "cumulative_revenue": cumulative_revenue,
+            "cumulative_degradation": cumulative_degradation,
+            "cumulative_profit": cumulative_profit,
+            **obs_features,
+        })
+
+        obs_vec = _np.asarray(next_obs, dtype=_np.float32)
+        done = terminated or truncated
+        step += 1
+
+    return rows
+
+
+def main() -> None:
+    args = parse_args()
+    device = resolve_device(args.device)
+    set_seed(args.seed)
+
+    # Load optional training YAML for overrides (actor/critic LR, gamma, lr_schedule, etc.)
+    training_yaml_path = Path("config/training.yaml")
+    yaml_cfg = {}
+    if training_yaml_path.exists():
+        try:
+            with training_yaml_path.open("r", encoding="utf-8") as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"Warning: failed to read {training_yaml_path}: {e}")
+    algo_cfg = (yaml_cfg.get("algorithm") or {}) if isinstance(yaml_cfg, dict) else {}
+    train_cfg = (yaml_cfg.get("training") or {}) if isinstance(yaml_cfg, dict) else {}
+    exploration_cfg = (yaml_cfg.get("exploration") or {}) if isinstance(yaml_cfg, dict) else {}
+
+    env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
+    env.action_space.seed(args.seed)
+
+    env.np_random, _ = seeding.np_random(args.seed)
+
+    state_dim = int(env.observation_space.shape[0])
+    action_dim = int(np.prod(env.action_space.shape))
+
+    # Align days-per-epoch with the number of unique training days when unspecified or <= 0
+    num_train_days = int(len(getattr(env, "dates", []))) if hasattr(env, "dates") else 0
+    if num_train_days <= 0:
+        raise RuntimeError("Training dataset has no days. Check --data-path and feature files.")
+    # Always set days-per-epoch to the number of training days
+    print(f"Setting days-per-epoch to number of training days: {num_train_days}")
+    args.days_per_epoch = num_train_days
+
+    # Allow YAML to override core algorithm knobs when present
+    gamma_val = float(algo_cfg.get("gamma", args.gamma)) if algo_cfg else args.gamma
+    tau_val = float(algo_cfg.get("tau", args.tau)) if algo_cfg else args.tau
+    actor_lr_val = float(algo_cfg.get("actor_lr", args.actor_lr if args.actor_lr is not None else args.lr))
+    critic_lr_val = float(algo_cfg.get("critic_lr", args.critic_lr if args.critic_lr is not None else args.lr))
+    exploration_std_val = float(exploration_cfg.get("noise_std", args.exploration_std)) if exploration_cfg else args.exploration_std
+    target_std_val = float(algo_cfg.get("target_noise", args.target_std)) if algo_cfg else args.target_std
+    noise_clip_val = float(algo_cfg.get("noise_clip", args.noise_clip)) if algo_cfg else args.noise_clip
+
+    config = TD3Config(
+        gamma=gamma_val,
+        tau=tau_val,
+        policy_delay=args.policy_delay,
+        lr=args.lr,
+        actor_lr=actor_lr_val,
+        critic_lr=critic_lr_val,
+        exploration_std=exploration_std_val,
+        target_std=target_std_val,
+        noise_clip=noise_clip_val,
+        action_low=float(env.action_space.low.min()),
+        action_high=float(env.action_space.high.max()),
+    )
+
+    agent = TD3Agent(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        config=config,
+        device=device,
+    )
+
+    # Optional learning-rate scheduler from YAML
+    actor_scheduler = None
+    critic_scheduler = None
+    lr_sched_cfg = train_cfg.get("lr_schedule") if isinstance(train_cfg, dict) else None
+    if isinstance(lr_sched_cfg, dict) and lr_sched_cfg.get("type", "").lower() == "step":
+        from torch.optim.lr_scheduler import StepLR
+        decay_factor = float(lr_sched_cfg.get("decay_factor", 0.5))
+        decay_epochs = int(lr_sched_cfg.get("decay_epochs", 50))
+        actor_scheduler = StepLR(agent.actor_optimizer, step_size=decay_epochs, gamma=decay_factor)
+        critic_scheduler = StepLR(agent.critic_optimizer, step_size=decay_epochs, gamma=decay_factor)
+        print(f"LR schedule enabled: StepLR every {decay_epochs} epochs, factor={decay_factor}")
+
+    buffer = ReplayBuffer(state_dim=state_dim, action_dim=action_dim, capacity=args.buffer_size)
+
+    total_episodes = args.epochs * args.days_per_epoch
+
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    csv_writer = initialize_csv(args.csv_log) if args.csv_log else None
+
+    episode_returns: List[float] = []
+    print(f"Using device={device}, seed={args.seed}")
+    print(f"Starting training on device {device} with {total_episodes} episodes")
+
+    episode_counter = 0
+    last_avg_return = float("nan")
+
+    try:
+        for epoch in range(args.epochs):
+            for day in range(args.days_per_epoch):
+                episode_counter += 1
+                episode_seed = int(env.np_random.integers(0, 2**32 - 1, dtype=np.uint32))
+                day_index = episode_seed % len(env.dates)
+                selected_day = env.dates[int(day_index)]
+                obs, _ = env.reset(seed=episode_seed, options={"date": selected_day})
+                obs_vec = np.asarray(obs, dtype=np.float32)
+
+                done = False
+                episode_return = 0.0
+                metrics_accumulator: Dict[str, float] = {
+                    "revenue_pv_grid": 0.0,
+                    "revenue_energy": 0.0,
+                    "revenue_reserve": 0.0,
+                    "cost_degradation": 0.0,
+                }
+                step_info: Dict[str, float] = {}
+
+                step = 0
+                # Maintain full observation history within the episode
+                obs_history: List[np.ndarray] = []
+                while not done:
+                    step += 1
+                    # RL clean-up patch: append and truncate to last seq_len steps
+                    obs_history.append(obs_vec)
+                    if len(obs_history) > args.seq_len:
+                        obs_history.pop(0)
+                    if len(buffer) < args.warmup_steps:
+                        action = env.action_space.sample().astype(np.float32)
+                    else:
+                        state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
+                        mask = compute_action_mask(env)
+                        action_seq = agent.act(
+                            state_seq,
+                            eval_mode=args.eval_mode,
+                            action_mask=mask,
+                        )  # [1, T, A]
+                        last_action = action_seq[0, -1]  # take action for the latest timestep, shape [A]
+                        action = np.asarray(last_action, dtype=np.float32)
+
+                    next_obs, reward, terminated, truncated, step_info = env.step(action)
+
+                    done = terminated or truncated
+                    next_obs_vec = np.asarray(next_obs, dtype=np.float32)
+
+                    buffer.add(obs_vec, action, reward, next_obs_vec, done)
+                    episode_return += float(reward)
+                    metrics_accumulator["revenue_pv_grid"] += step_info.get("revenue_pv_grid", 0.0)
+                    metrics_accumulator["revenue_energy"] += step_info.get("revenue_energy", 0.0)
+                    metrics_accumulator["revenue_reserve"] += step_info.get("revenue_reserve", 0.0)
+                    metrics_accumulator["cost_degradation"] += step_info.get("cost_degradation", 0.0)
+
+                    obs_vec = next_obs_vec
+
+                    if len(buffer) >= args.warmup_steps:
+                        for _ in range(args.updates_per_step):
+                            agent.update(buffer, batch_size=args.batch_size, seq_len=args.seq_len)
+
+                # Episode finished
+                episode_returns.append(episode_return)
+                episode_profit = step_info.get("episode_profit", episode_return)
+                episode_revenue = step_info.get("episode_revenue", metrics_accumulator["revenue_pv_grid"] + metrics_accumulator["revenue_energy"] + metrics_accumulator["revenue_reserve"])
+                episode_degradation = step_info.get("episode_degradation", metrics_accumulator["cost_degradation"])
+
+                if csv_writer is not None:
+                    csv_writer.writerow(
+                        [
+                            episode_counter,
+                            episode_return,
+                            episode_profit,
+                            episode_revenue,
+                            episode_degradation,
+                            metrics_accumulator["revenue_pv_grid"],
+                            metrics_accumulator["revenue_energy"],
+                            metrics_accumulator["revenue_reserve"],
+                            metrics_accumulator["cost_degradation"],
+                        ]
+                    )
+                    csv_writer.file.flush()
+
+                if episode_counter % args.log_interval == 0:
+                    recent_returns = episode_returns[-args.log_interval :]
+                    avg_return = np.mean(recent_returns)
+                    last_avg_return = float(avg_return)
+                    print(
+                        f"Episode {episode_counter:04d} | Epoch {epoch+1}/{args.epochs} | Return {episode_return:8.2f} | "
+                        f"Avg{args.log_interval}: {avg_return:8.2f} | Profit {episode_profit:8.2f} | "
+                        f"Revenue {episode_revenue:8.2f} | Degradation {episode_degradation:8.2f}"
+                    )
+
+                if episode_counter % args.checkpoint_interval == 0:
+                    if not np.isfinite(last_avg_return):
+                        window = episode_returns[-args.log_interval :]
+                        if window:
+                            last_avg_return = float(np.mean(window))
+                        elif episode_returns:
+                            last_avg_return = float(np.mean(episode_returns))
+                        else:
+                            last_avg_return = float("nan")
+
+                    actor_path = args.checkpoint_dir / f"actor_ep{episode_counter:04d}.pth"
+                    critic_path = args.checkpoint_dir / f"critic_ep{episode_counter:04d}.pth"
+                    torch.save(agent.actor.state_dict(), actor_path)
+                    torch.save(agent.critic.state_dict(), critic_path)
+                    meta_path = args.checkpoint_dir / "checkpoint_meta.json"
+                    meta_path.parent.mkdir(parents=True, exist_ok=True)
+                    with meta_path.open("a", encoding="utf-8") as meta_file:
+                        json.dump({"episode": episode_counter, "avg_return": last_avg_return}, meta_file)
+                        meta_file.write("\n")
+                    print(f"Saved checkpoints at episode {episode_counter} -> {actor_path}, {critic_path}")
+
+                    # Quick 1-day rollout (optional)
+                    if args.quick_eval_interval and args.quick_eval_interval > 0:
+                        if episode_counter % int(args.quick_eval_interval) == 0:
+                            if not args.quick_eval_date:
+                                print("quick-eval skipped: --quick-eval-date not set")
+                            else:
+                                try:
+                                    qe_env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
+                                    rows = quick_rollout(qe_env, agent, args.quick_eval_date)
+                                    args.quick_eval_outdir.mkdir(parents=True, exist_ok=True)
+                                    out_csv = args.quick_eval_outdir / f"hourly_ep{episode_counter:04d}.csv"
+                                    with out_csv.open("w", newline="") as f:
+                                        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                                        writer.writeheader()
+                                        writer.writerows(rows)
+                                    print(f"[quick] saved {out_csv}")
+                                except Exception as e:
+                                    print(f"[quick] rollout failed: {e}")
+            # Step LR schedulers at end of epoch
+            if actor_scheduler is not None:
+                actor_scheduler.step()
+                critic_scheduler.step()
+                if (epoch + 1) % max(1, int(lr_sched_cfg.get("decay_epochs", 50))) == 0:
+                    cur_actor_lr = agent.actor_optimizer.param_groups[0]["lr"]
+                    cur_critic_lr = agent.critic_optimizer.param_groups[0]["lr"]
+                    print(f"[LR] Epoch {epoch+1}: actor_lr={cur_actor_lr:.6g}, critic_lr={cur_critic_lr:.6g}")
+
+        print("Training completed")
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received; terminating training loop.")
+    finally:
+        close_csv(csv_writer)
+        print("Training interrupted, CSV closed safely")
+
+
+if __name__ == "__main__":
+    main()
+
+

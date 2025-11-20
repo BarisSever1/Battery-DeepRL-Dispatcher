@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Balancing_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-6:balancingdocument:4:4">
+	<mRID>17_1_BC_example</mRID>
+	<revisionNumber>1</revisionNumber>
+	<type>A81</type>	<!-- A81: Contracted Reserve -->
+	<process.processType>A52</process.processType>	<!-- A46: RR; A47: mFRR; A51: aFRR; A52: FCR -->
+	<sender_MarketParticipant.mRID codingScheme="A01">10XCZ-CEPS-GRIDE</sender_MarketParticipant.mRID>
+	<sender_MarketParticipant.marketRole.type>A39</sender_MarketParticipant.marketRole.type> 	<!-- A39: Data Provider -->
+	<receiver_MarketParticipant.mRID codingScheme="A01">10X1001A1001A450</receiver_MarketParticipant.mRID>
+	<receiver_MarketParticipant.marketRole.type>A32</receiver_MarketParticipant.marketRole.type> 	<!-- A32: Market Information Aggregator -->
+	<createdDateTime>2021-08-15T11:50:03Z</createdDateTime>
+	<!-- <docStatus>
+		<value>A09</value>
+	</docStatus>-->	<!-- A09: Cancelled; Used to cancel all the data published via this document -->
+	<area_Domain.mRID codingScheme="A01">10YCZ-CEPS-----N</area_Domain.mRID> 	<!-- EIC of SCA -->
+	<allocationDecision_DateAndOrTime.dateTime>2021-08-13T22:28:00Z</allocationDecision_DateAndOrTime.dateTime>	<!-- Date and time of procurement; Mandatory -->
+	<period.timeInterval> 	<!-- The interval for which the data are submitted -->
+		<start>2021-08-14T22:00Z</start>
+		<end>2021-08-15T22:00Z</end>
+	</period.timeInterval>
+	<TimeSeries>	<!-- Each TS equals a separate instance -->
+		<mRID>1</mRID>
+		<businessType>B95</businessType>	<!-- B95: Procured Capacity -->
+		<type_MarketAgreement.type>A01</type_MarketAgreement.type>	<!-- Optional; A01: Daily; A02: Weekly; A03: Monthly; A04: Yearly; A06: Long term; A13: Hourly -->
+		<standard_MarketProduct.marketProductType>A01</standard_MarketProduct.marketProductType>	<!-- A01: Standard -->
+		<!-- <original_MarketProduct.marketProductType>A02</original_MarketProduct.marketProductType> -->	<!-- A02: Specific; A03: Product from integrated scheduling process; A04: Local balancing product -->
+		<mktPSRType.psrType>A04</mktPSRType.psrType>	<!-- A04: Generation; A05: Load; A03: Resource object (Mixed) -->
+		<flowDirection.direction>A03</flowDirection.direction> 	<!-- A01: Up; A02: Down; A03: Up and Down (Symmetric); Up/Down and Symmetric must not be submitted in ne document for the same delivery period.  -->
+		<currency_Unit.name>EUR</currency_Unit.name>	<!-- Used when prices are included -->
+		<quantity_Measure_Unit.name>MAW</quantity_Measure_Unit.name> 	<!-- MAW: Megawatt; Used when volumes are included -->
+		<curveType>A03</curveType> <!-- A01: Sequential fixed block; A03: Variable sized block-->
+		<!--<cancelledTS>A01</cancelledTS>--> <!--A01: Cancelled; Used to cancel all the data published via this timeSeries -->
+		<Period> <!-- One or multiple periods of the instance -->
+			<timeInterval> 	<!-- Interval inside the one in the header; Periods inside one TS must not overlap -->
+				<start>2021-08-14T22:00Z</start>
+				<end>2021-08-15T22:00Z</end>
+			</timeInterval>
+			<resolution>PT60M</resolution>	<!-- PT15M, PT30M, PT60M -->
+			<Point>
+				<position>1</position>
+				<quantity>3.38</quantity>	<!-- Volumes value -->
+				<procurement_Price.amount>3.38</procurement_Price.amount>	<!-- Prices value -->
+				<imbalance_Price.category>A06</imbalance_Price.category>	<!-- Price category; Only mandatory in export -->
+			</Point>			
+		</Period>
+	</TimeSeries>
+</Balancing_MarketDocument>

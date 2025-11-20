@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Balancing_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-6:balancingdocument:4:1">
+	<mRID>48f16f84d00147ccbf9b502845caeb71</mRID>				<!-- Mandatory: Unique identification of the document -->
+	<revisionNumber>1</revisionNumber>							<!-- Mandatory: Unique version incremented with each submission of a document with the same mRID -->
+	<type>A84</type>											<!-- Mandatory: A84 = Activated balancing prices -->
+	<process.processType>A16</process.processType>				<!-- Mandatory: A16 = Realised; A60 = Scheduled activation mFRR; A61 = Direct activation mFRR; A67 = aFRR CS; A68 = aFRR LS -->
+	<sender_MarketParticipant.mRID codingScheme="A01">10X1001A1001A450</sender_MarketParticipant.mRID>	<!-- Mandatory - Sender organization EIC -->
+	<sender_MarketParticipant.marketRole.type>A32</sender_MarketParticipant.marketRole.type>
+	<receiver_MarketParticipant.mRID codingScheme="A01">10X1001A1001A450</receiver_MarketParticipant.mRID>	<!-- Mandatory: EE EIC -->
+	<receiver_MarketParticipant.marketRole.type>A33</receiver_MarketParticipant.marketRole.type>	<!-- Mandatory: A32 = market information aggregator -->
+	<createdDateTime>2022-02-25T09:41:25Z</createdDateTime>		<!-- Mandatory -->
+	<area_Domain.mRID codingScheme="A01">10YAT-APG------L</area_Domain.mRID>	<!-- Mandatory - EIC code of SCA/LFA/IBA -->
+	<period.timeInterval>										<!-- Mandatory -->
+		<start>2022-02-25T00:00Z</start>
+		<end>2022-02-25T09:30Z</end>
+	</period.timeInterval>
+	<TimeSeries>
+		<mRID>1</mRID>											<!-- Mandatory - Unique identification of the time series -->
+		<businessType>A96</businessType>						<!-- Mandatory - Reserve type: A95 = FCR; A96 = aFRR; A97 = mFRR; A98 = RR -->
+		<!-- <standard_MarketProduct.marketProductType>A01</standard_MarketProduct.marketProductType> -->	<!-- Optional - Type of Product: A01 = Standard; either standard or original is filled, not both at the same time -->
+		<original_MarketProduct.marketProductType></original_MarketProduct.marketProductType>	<!-- Optional - Type of Product: A02 = Specific; A04 = Local; either standard or original is filled, not both at the same time -->
+		<mktPSRType.psrType>A04</mktPSRType.psrType>			<!-- Optional - Source type of the reserve: A03 = Resource object; A04 = Generation; A05 = Load -->
+		<flowDirection.direction>A02</flowDirection.direction>	<!-- Mandatory - Direction of energy flow: A01 = Up; A02 = Down -->
+		<currency_Unit.name>EUR</currency_Unit.name>			<!-- Mandatory -->
+		<price_Measure_Unit.name>MWH</price_Measure_Unit.name>	<!-- Mandatory: MWH -->
+		<curveType>A01</curveType>								<!-- A01 = Sequential fixed block | A03 = Variable sized blocks -->
+		<!-- <cancelledTS>A01</cancelledTS>						A01 =Yes – the time series data has been withdrawn-->
+		<Period>
+			<timeInterval>
+				<start>2022-02-25T00:00Z</start>
+				<end>2022-02-25T09:30Z</end>
+			</timeInterval>
+			<resolution>PT15M</resolution>						<!-- Mandatory: PT1S or PT4S for aFRR CS; PT15M/PT30M/PT60M for the rest -->
+			<Point>
+				<position>1</position>
+				<activation_Price.amount>-0.49</activation_Price.amount>	<!-- Mandatory if point exists - the activation price -->
+				<imbalance_Price.category>A06</imbalance_Price.category>	<!-- Only used in exports and not used for submissions: A06 = Average bid price; A07 = Single marginal price; A08 = Cross-border marginal price -->
+			</Point>
+			<Point>
+				<position>2</position>
+				<activation_Price.amount>-0.54</activation_Price.amount>
+				<imbalance_Price.category>A06</imbalance_Price.category>
+			</Point>
+			<Point>
+				<position>3</position>
+				<activation_Price.amount>3.76</activation_Price.amount>
+				<imbalance_Price.category>A06</imbalance_Price.category> 
+			</Point>
+		</Period>
+	</TimeSeries>
+	<TimeSeries>
+		<mRID>2</mRID>
+		<businessType>A96</businessType>
+		<mktPSRType.psrType>A04</mktPSRType.psrType>
+		<flowDirection.direction>A01</flowDirection.direction>
+		<currency_Unit.name>EUR</currency_Unit.name>
+		<price_Measure_Unit.name>MWH</price_Measure_Unit.name>
+		<curveType>A01</curveType>								<!-- A01 = Sequential fixed block | A03 = Variable sized blocks -->
+		<!-- <cancelledTS></cancelledTS>						Dependent A01 =Yes – the time series data has been withdrawn -->
+		<Period>
+			<timeInterval>
+				<start>2022-02-25T00:00Z</start>
+				<end>2022-02-25T09:30Z</end>
+			</timeInterval>
+			<resolution>PT15M</resolution>
+			<Point>
+				<position>1</position>
+				<activation_Price.amount>227.94</activation_Price.amount>
+				<imbalance_Price.category>A06</imbalance_Price.category>
+			</Point>
+			<Point>
+				<position>2</position>
+				<activation_Price.amount>231.74</activation_Price.amount>
+				<imbalance_Price.category>A06</imbalance_Price.category>
+			</Point>
+			<Point>
+				<position>3</position>
+				<activation_Price.amount>224.00</activation_Price.amount>
+				<imbalance_Price.category>A06</imbalance_Price.category>
+			</Point>
+		</Period>
+	</TimeSeries>
+</Balancing_MarketDocument>

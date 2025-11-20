@@ -1,0 +1,79 @@
+# training.yaml — minimal, paper-faithful TD3+LSTM config
+
+algorithm:
+  name: TD3
+  gamma: 0.99             # slightly sub-1 for smoother temporal credit
+  tau: 0.005              # Polyak (slower target updates for stability)
+  policy_delay: 2         # delayed actor + target updates
+  target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)
+  noise_clip: 0.4
+  actor_lr: 1e-4
+  critic_lr: 1e-4
+  optimizer: Adam
+  normalize_reward: false  # rewards already in physical units
+
+networks:
+  actor:
+    lstm_hidden_size: 64
+    lstm_num_layers: 1
+    hidden_sizes: [64, 64]
+    activation: ReLU
+    output_activation: Tanh
+  critic:
+    lstm_hidden_size: 64
+    lstm_num_layers: 1
+    hidden_sizes: [64, 64]
+    activation: ReLU
+
+training:
+  # one episode = one day (24 steps)
+  max_episode_length: 24
+  epochs: 100                  # long training run
+  train_days_per_epoch: 22  
+  batch_size: 64
+  buffer_size: 1000000        # 1e6 per paper
+  min_buffer_size: 20000
+  sequence_length: 24         # 24-step sequences
+  train_every_steps: 1        # critic updates each step
+  # actor/target update cadence governed by policy_delay (no separate target_update_freq)
+  max_grad_norm: 1.0
+  lr_schedule:
+    type: step
+    decay_factor: 0.5
+    decay_epochs: 50
+
+exploration:
+  noise_type: Normal
+  noise_std: 0.5            # slightly higher for richer exploration
+
+environment:
+  action_masks:
+    enable_soc_masks: true
+    min_soc_for_discharge: 0.10
+    max_soc_for_charge: 0.90
+
+evaluation:
+  eval_every_epochs: 1
+  eval_days: 20               # separate eval set (not in train)
+  deterministic: true
+
+checkpointing:
+  save_best: true             # best by eval net profit
+  save_freq_epochs: 5
+  checkpoint_dir: checkpoints
+  keep_checkpoints: 3
+
+logging:
+  log_level: INFO
+  log_freq_steps: 1000
+  tensorboard: true
+  tensorboard_log_dir: runs
+
+device:
+  device: auto                # "cuda" if available else "cpu"
+  num_envs: 1                 # single sequential env (LSTM)
+  mixed_precision: false
+
+reproducibility:
+  seed: 42
+  deterministic: false

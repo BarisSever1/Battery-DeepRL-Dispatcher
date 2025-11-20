@@ -1,0 +1,214 @@
+# features.yaml — 17-dimensional state vector (exact order matters)
+
+schema_version: 1
+
+features:
+  # --- Temporal (3) ---
+  - key: k
+    desc: Hour of day
+    type: int
+    source: derived
+    range: [0, 23]
+    norm: minmax
+    min: 0
+    max: 23
+
+  - key: weekday
+    desc: Day of week (0=Mon..6=Sun)
+    type: int
+    source: derived
+    range: [0, 6]
+    norm: minmax
+    min: 0
+    max: 6
+
+  - key: season
+    desc: Season (0=Winter,1=Spring,2=Summer,3=Fall)
+    type: int
+    source: derived
+    range: [0, 3]
+    norm: minmax
+    min: 0
+    max: 3
+
+  # --- Prices & operations (6) ---
+  - key: price_em
+    desc: Day-ahead energy price (HUF/MWh)
+    type: float
+    source: column
+    column: price_em_huf_per_mwh
+    norm: minmax
+    min: -1000
+    max: 100000
+
+  - key: price_as
+    desc: Reserve/ancillary price (HUF/MW/h)
+    type: float
+    source: column
+    column: price_as_huf_per_mwh  # or _per_mw_h — set to your actual header!
+    norm: minmax
+    min: 0
+    max: 50000
+
+  - key: p_res_total
+    desc: RES available generation to AC bus (MW)
+    type: float
+    source: column
+    column: res_gen_mw
+    norm: minmax
+    min: 0
+    max: 20          # match your POI/export cap
+
+  - key: soc
+    desc: Battery state of charge (0..1)
+    type: float
+    source: env_state
+    norm: minmax
+    min: 0.0
+    max: 1.0
+
+  - key: dod
+    desc: DOD within current day-part (Eq.18)
+    type: float
+    source: env_state
+    norm: minmax
+    min: 0.0
+    max: 1.0
+
+  # --- Daily market context (8) ---
+  - key: price_em_max_morning
+    desc: Max energy price in morning window
+    type: float
+    source: derived
+    from: price_em
+    window: morning
+    op: max
+    norm: minmax
+    min: -1000
+    max: 100000
+
+  - key: price_em_max_evening
+    desc: Max energy price in evening window
+    type: float
+    source: derived
+    from: price_em
+    window: evening
+    op: max
+    norm: minmax
+    min: -1000
+    max: 100000
+/
+  - key: k_em_max_morning
+    desc: Hour index of morning max
+    type: int
+    source: derived
+    from: price_em
+
+    window: morning
+    op: argmax
+    norm: minmax
+    min: 0
+    max: 23
+
+  - key: k_em_max_evening
+    desc: Hour index of evening max
+    type: int
+    source: derived
+    from: price_em
+    window: evening
+    op: argmax
+    norm: minmax
+    min: 0
+    max: 23
+
+  - key: price_em_min
+    desc: Daily minimum energy price
+    type: float
+    source: derived
+    from: price_em
+    window: full_day
+    op: min
+    norm: minmax
+    min: -1000
+    max: 100000
+
+  - key: k_em_min
+    desc: Hour index of daily minimum price
+    type: int
+    source: derived
+    from: price_em
+    window: full_day
+    op: argmin
+    norm: minmax
+    min: 0
+    max: 23
+
+  - key: price_as_min
+    desc: Daily min reserve price
+    type: float
+    source: derived
+    from: price_as
+    window: full_day
+    op: min
+    norm: minmax
+    min: 0
+    max: 50000
+
+  - key: price_as_max
+    desc: Daily max reserve price
+    type: float
+    source: derived
+    from: price_as
+    window: full_day
+    op: max
+    norm: minmax
+    min: 0
+    max: 50000
+
+  # --- Planning aid (1) ---
+  - key: time_to_peak_hour
+    desc: peak_hour - t (>=0)
+    type: int
+    source: derived
+    from: k
+    window: full_day
+    op: time_to_peak
+    norm: minmax
+    min: 0
+    max: 23
+
+# --- Global normalization config ---
+normalization:
+  method: minmax
+  target_range: [-1, 1]     # paper uses [-1,1]
+  per_feature: true
+  fit_on: train_only        # stats from training set; apply to val/test
+
+windows:
+  method: dynamic              # dynamic | static
+  split_hour: 12               # halves => [0,11] and [12,23]
+  min_separation_hours: 2
+  tie_break: earliest
+
+  timezone: Europe/Budapest    # ensure local market time
+  dst_policy: keep_local       # or 'utc_align' if you normalize to UTC
+
+  # Fallback if dynamic fails (NaNs/flat day)
+  static:
+    # Use end-exclusive to avoid ambiguity; align with split boundary
+    scheme: half_day           # half_day | narrowed
+    # Half-day scheme (end-exclusive):
+    morning_he: [0, 12]        # [0..11]
+    evening_he: [12, 24]       # [12..23]
+    full_day_he: [0, 24]       # [0..23]
+    # If you prefer narrower windows, keep them inside halves:
+    morning_narrow_he: [7, 12]   # [07..11]
+    evening_narrow_he: [16, 22]  # [16..21]
+
+
+
+# --- Missing values & outliers ---
+data_quality:
+  missing: forward_fill      # or zero, interpolate
+  clip_outliers: true
+  z_thresh: 3.0

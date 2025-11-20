@@ -1,0 +1,128 @@
+# Physical System Constraints and Limits
+# This file defines all technical constraints for the PV-BESS system
+# Used by environment, safety checks, and validation
+
+# ============================================================================
+# Battery Energy Storage System (BESS) Specifications
+# ============================================================================
+
+bess:
+  # Power rating of the battery converter (MW)
+  power_rating_mw: 20.0
+  
+  # Usable energy capacity (MWh) - typically 80-90% of total capacity
+  energy_capacity_mwh: 60.0
+
+  
+  # State of Charge limits (fraction of usable capacity)
+  soc_min: 0.10  # 10% minimum SOC
+  soc_max: 0.90  # 90% maximum SOC
+  
+
+  
+  # Individual efficiencies
+  charge_efficiency: 0.97
+  discharge_efficiency: 0.97
+
+  
+  # Maximum charge/discharge power per hour (fraction of power rating)
+  max_charge_rate: 1.0  # 100% of power rating
+  max_discharge_rate: 1.0  # 100% of power rating
+  
+  
+  # Storage duration (hours) - how long battery can run at full power
+  storage_duration_hours: 3.0
+  
+  # Expected annual cycles
+  expected_annual_cycles: 300
+
+# ============================================================================
+# Renewable Energy Source (RES) Specifications
+# ============================================================================
+
+res:
+  # Solar PV capacity (MW) - AC capacity
+  pv_ac_capacity_mw: 20.0
+  
+  # Solar PV DC capacity (MW)
+  pv_dc_capacity_mw: 45.64
+  
+  # DC/AC ratio
+  dc_ac_ratio: 2.28
+  
+  # Inverter efficiency for RES
+  inverter_efficiency: 0.97
+  
+
+  
+  # Solar annual degradation (%)
+  solar_annual_degradation_percent: 0.5
+  
+  # System losses
+  total_loss_percent: 2.0
+  ac_cabling_loss_percent: 1.0
+  system_unavailability_percent: 0.0
+  ac_transformer_loss_percent: 1.0
+
+# ============================================================================
+# Grid Connection and Export Limits
+# ============================================================================
+
+grid:
+  # Point of Interconnection (POI) power limit (MW)
+  poi_power_limit_mw: 20.0
+  
+  # Inverter total rating (MW) - must be >= max(PV + BESS)
+  total_inverter_rating_mw: 48.0
+  
+  # Grid import allowed (boolean)
+  # True: BESS can charge from grid
+  # False: BESS only charges from RES surplus (DC-coupled mode)
+  allow_grid_import: true
+  
+  # Maximum grid import power (MW) - only if allow_grid_import is true
+  max_grid_import_mw: 20.0
+
+
+# ============================================================================
+# Safety and Emergency Constraints
+# ============================================================================
+
+#safety:
+  # Emergency shutdown SOC threshold
+  #emergency_soc_min: 0.05
+  #emergency_soc_max: 0.95
+  
+  # Temperature limits (°C)
+  #min_temperature_c: -10.0
+  #max_temperature_c: 45.0
+  
+  # Voltage limits (V) - if applicable
+  #min_voltage_v: 0.0
+  #max_voltage_v: 1000.0
+  
+  # Current limits (A) - if applicable
+  #max_current_a: 1000.0
+
+
+
+# ============================================================================
+# Degradation Cost Parameters (hardcoded for this battery)
+# ============================================================================
+
+degradation:
+  # Capital cost per MWh of installed energy capacity (EUR/MWh)
+  capex_eur_per_mwh: 175000.0
+
+  # Maximum DOD used for cycle-life specification (fraction 0..1)
+  dod_max_for_cost: 0.80
+
+  # Number of cycles at DOD_max assumed for lifetime cost allocation
+  n_cycles_at_dod_max: 5000
+
+  # Average DOD and cycles for linear degradation calibration (fraction, count)
+  # Used only by the linear degradation model to set a stable per-throughput cost
+  # independent of the current DOD bucket.
+  dod_avg_for_linear: 0.60
+  n_cycles_avg_for_linear: 6000
+
