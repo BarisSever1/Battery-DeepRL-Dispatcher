@@ -1,0 +1,35 @@
+{
+  "TD3 (Nonlinear)": {
+    "mean_profit": 7531.898667419264,
+    "mean_revenue": 7656.05222859569,
+    "mean_degradation": 124.15356117642659,
+    "mean_soc_min": 0.3861755201283774,
+    "mean_soc_max": 0.6310236611743262,
+    "mean_soc_final": 0.5371696548402334,
+    "mean_dod_max": 0.2120255496819623,
+    "mean_throughput_mwh": 31.255692043923773,
+    "mean_cycles": 2.3070722832601955
+  },
+  "PV+DS3 (Reserve Only)": {
+    "mean_profit": 8059.8530893471225,
+    "mean_revenue": 8059.8530893471225,
+    "mean_degradation": 0.0,
+    "mean_soc_min": 0.5,
+    "mean_soc_max": 0.5,
+    "mean_soc_final": 0.5,
+    "mean_dod_max": 0.0,
+    "mean_throughput_mwh": 0.0,
+    "mean_cycles": 0.0
+  },
+  "PV+DA (Heuristic)": {
+    "mean_profit": 9781.902426431565,
+    "mean_revenue": 10381.216453344514,
+    "mean_degradation": 599.3140269129482,
+    "mean_soc_min": 0.46486417964575555,
+    "mean_soc_max": 0.7975458549793183,
+    "mean_soc_final": 0.47444621285204097,
+    "mean_dod_max": 0.3155147285435897,
+    "mean_throughput_mwh": 71.35962856102473,
+    "mean_cycles": 3.77280236098048
+  }
+}
