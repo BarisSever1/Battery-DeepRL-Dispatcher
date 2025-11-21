@@ -206,29 +206,6 @@ def denormalize_observation_features(
     return denormalized
 
 
-def compute_action_mask(env: BESSEnv) -> Optional[Tuple[float, float]]:
-    """Infer action bounds from the environment's current peak-window configuration."""
-    hour = getattr(env, "current_hour", None)
-    if hour is None:
-        return None
-
-    def _to_set(hours):
-        if hours is None:
-            return set()
-        if isinstance(hours, set):
-            return hours
-        return set(hours)
-
-    morning_hours = _to_set(getattr(env, "morning_peak_hours", None))
-    evening_hours = _to_set(getattr(env, "evening_peak_hours", None))
-
-    if not morning_hours and not evening_hours:
-        return None
-
-    in_peak = (hour in morning_hours) or (hour in evening_hours)
-    return (0.0, 1.0) if in_peak else (-1.0, 0.0)
-
-
 def evaluate_td3_agent(
     env: BESSEnv,
     agent: TD3Agent,
@@ -274,8 +251,7 @@ def evaluate_td3_agent(
             if len(obs_history) > 12:
                 obs_history.pop(0)
             state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
-            mask = compute_action_mask(env)
-            action_seq = agent.act(state_seq, eval_mode=True, action_mask=mask)  # [1, T, 1]
+            action_seq = agent.act(state_seq, eval_mode=True)  # [1, T, 1]
             action = float(action_seq[0, -1, 0])  # take action for the latest timestep
             action_values.append(float(action))
 

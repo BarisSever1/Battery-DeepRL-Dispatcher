@@ -46,12 +46,6 @@ exploration:
   noise_type: Normal
   noise_std: 0.5            # slightly higher for richer exploration
 
-environment:
-  action_masks:
-    enable_soc_masks: true
-    min_soc_for_discharge: 0.10
-    max_soc_for_charge: 0.90
-
 evaluation:
   eval_every_epochs: 1
   eval_days: 20               # separate eval set (not in train)

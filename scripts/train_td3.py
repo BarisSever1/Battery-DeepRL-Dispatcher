@@ -8,7 +8,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -94,29 +94,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def compute_action_mask(env: BESSEnv) -> Optional[Tuple[float, float]]:
-    """Infer (low, high) action bounds from the environment's current peak window."""
-    hour = getattr(env, "current_hour", None)
-    if hour is None:
-        return None
-
-    def _to_set(hours):
-        if hours is None:
-            return set()
-        if isinstance(hours, set):
-            return hours
-        return set(hours)
-
-    morning_hours = _to_set(getattr(env, "morning_peak_hours", None))
-    evening_hours = _to_set(getattr(env, "evening_peak_hours", None))
-
-    if not morning_hours and not evening_hours:
-        return None
-
-    in_peak = (hour in morning_hours) or (hour in evening_hours)
-    return (0.0, 1.0) if in_peak else (-1.0, 0.0)
 
 
 class CSVWriter:
@@ -205,9 +182,8 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
         obs_history.append(obs_vec)
         if len(obs_history) > history_len:
             obs_history.pop(0)
-        state_seq = _np.asarray(obs_history, dtype=_np.float32)[_np.newaxis, :, :]  # [1,T,F]
-        mask = compute_action_mask(env)
-        action_seq = agent.act(state_seq, eval_mode=True, action_mask=mask)
+        state_seq = _np.asarray(obs_history, dtype=_np.float32)[ _np.newaxis, :, :]  # [1,T,F]
+        action_seq = agent.act(state_seq, eval_mode=True)
         action = float(action_seq[0, -1, 0])
 
         next_obs, reward, terminated, truncated, info = env.step(_np.array([action], dtype=_np.float32))
@@ -383,11 +359,9 @@ def main() -> None:
                         action = env.action_space.sample().astype(np.float32)
                     else:
                         state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
-                        mask = compute_action_mask(env)
                         action_seq = agent.act(
                             state_seq,
                             eval_mode=args.eval_mode,
-                            action_mask=mask,
                         )  # [1, T, A]
                         last_action = action_seq[0, -1]  # take action for the latest timestep, shape [A]
                         action = np.asarray(last_action, dtype=np.float32)

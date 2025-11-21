@@ -67,7 +67,6 @@ class BESSEnv(gym.Env):
             np.random.seed(seed)
         
         # Load data and configuration
-        self._limits_config = None
         self._load_data(data_path)
         self._load_config(config_path)
         self._load_norm_params(norm_params_path)
@@ -80,16 +79,7 @@ class BESSEnv(gym.Env):
         self.cycle_penalty_eur_per_cycle = 2500.0  # € penalty per extra full cycle beyond target
         self.prepeak_morning_target_soc = 0.75
         self.prepeak_evening_target_soc = 0.80
-        self.prepeak_soc_penalty_coeff = 0.85  # scales with price * Pmax
-        self.prepeak_reserve_bonus_coeff = 0.35
-        self.general_reserve_floor = 0.40
-        self.low_soc_penalty_coeff = 0.45
-        self.terminal_soc_penalty_coeff = 1.0
-        self.charge_base_weight = 0.30
-        self.charge_cheap_boost = 0.35
-        self.charge_pv_boost = 0.25
-        self.charge_expensive_penalty = 0.45
-        self._apply_shaping_overrides()
+        self.prepeak_soc_penalty_coeff = 0.35  # scales with price * Pmax
         self.target_daily_throughput_mwh = 2.0 * self.E_capacity
         self.throughput_penalty_eur_per_mwh = 150.0
 
@@ -127,11 +117,6 @@ class BESSEnv(gym.Env):
         
         # Daily throughput tracking for cycle budget penalty
         self.daily_throughput = 0.0
-
-        # SOC deficit integrators for shaping
-        self.soc_deficit_integral_morning = 0.0
-        self.soc_deficit_integral_evening = 0.0
-        self.low_soc_integral = 0.0
         
     def _load_data(self, data_path: str):
         """Load normalized feature dataset."""
@@ -156,7 +141,6 @@ class BESSEnv(gym.Env):
         
         with open(path, 'r') as f:
             config = yaml.safe_load(f)
-        self._limits_config = config
         
         # Battery parameters
         bess = config['bess']
@@ -214,35 +198,6 @@ class BESSEnv(gym.Env):
             self.n_cycles_avg_for_linear = 6000
 
         print(f"Loaded config: {self.P_bess_max} MW / {self.E_capacity} MWh BESS")
-
-    def _apply_shaping_overrides(self):
-        """Allow optional shaping coefficients from config file."""
-        cfg = getattr(self, "_limits_config", None)
-        if not isinstance(cfg, dict):
-            return
-        shaping_cfg = cfg.get('reward_shaping', {})
-        if not isinstance(shaping_cfg, dict):
-            return
-
-        float_fields = [
-            'prepeak_morning_target_soc',
-            'prepeak_evening_target_soc',
-            'general_reserve_floor',
-            'prepeak_soc_penalty_coeff',
-            'prepeak_reserve_bonus_coeff',
-            'low_soc_penalty_coeff',
-            'terminal_soc_penalty_coeff',
-            'charge_base_weight',
-            'charge_cheap_boost',
-            'charge_pv_boost',
-            'charge_expensive_penalty',
-        ]
-        for field in float_fields:
-            if field in shaping_cfg:
-                try:
-                    setattr(self, field, float(shaping_cfg[field]))
-                except (TypeError, ValueError):
-                    continue
         
     def _load_norm_params(self, norm_params_path: str):
         """Load normalization parameters for denormalization."""
@@ -387,9 +342,6 @@ class BESSEnv(gym.Env):
         
         # Reset daily throughput tracker
         self.daily_throughput = 0.0
-        self.soc_deficit_integral_morning = 0.0
-        self.soc_deficit_integral_evening = 0.0
-        self.low_soc_integral = 0.0
         
         # Get initial observation
         obs = self._get_observation()
@@ -496,25 +448,12 @@ class BESSEnv(gym.Env):
         """
         # === ACTION PARSING: RL-friendly constant scaling ===
         # delta ∈ [-1,1] maps linearly to battery power [-Pmax, +Pmax]
-        raw_delta = float(np.clip(action[0], -1.0, 1.0))
+        delta = float(np.clip(action[0], -1.0, 1.0))
+        p_battery_cmd = delta * self.P_bess_max  # MW (unconstrained command)
 
         # --- 1) Fetch current data (denormalized)
         hour = self.current_hour
         row = self.day_data.iloc[hour]
-
-        # Restrict action space depending on peak windows:
-        morning_peak_hours = getattr(self, "morning_peak_hours", set())
-        evening_peak_hours = getattr(self, "evening_peak_hours", set())
-        in_peak = hour in morning_peak_hours or hour in evening_peak_hours
-        if in_peak:
-            # Allow discharge or idle only (0 … +1)
-            delta = float(np.clip(raw_delta, 0.0, 1.0))
-        else:
-            # Allow charge or idle only (−1 … 0)
-            delta = float(np.clip(raw_delta, -1.0, 0.0))
-        # Overwrite the agent command so logs reflect the enforced range
-        action = np.array([delta], dtype=np.float32)
-        p_battery_cmd = delta * self.P_bess_max  # MW (unconstrained command)
 
         price_em = self._denormalize('price_em', row['price_em'])      # €/MWh (energy market)
         price_as = self._denormalize('price_as', row['price_as'])      # €/MW·h (reserve)
@@ -580,17 +519,9 @@ class BESSEnv(gym.Env):
         p_reserve = p_reserve_feas
 
         # --- 6) Update SOC & DOD
-        # Track actual SOC movement to measure real throughput (post-clipping)
-        throughput_prev = self.daily_throughput
+        # DOD fix: now uses self.soc_previous and self.soc; removed unused parameters.
         self.soc_previous = self.soc
         self.soc = self._update_soc(p_battery)
-        soc_delta = abs(self.soc - self.soc_previous)  # fraction 0–1
-        soc_delta_mwh = soc_delta * self.E_capacity
-        self.daily_throughput += soc_delta_mwh
-        cycle_cap_mwh = 2.0 * self.E_capacity
-        prev_excess = max(0.0, throughput_prev - cycle_cap_mwh)
-        new_excess = max(0.0, self.daily_throughput - cycle_cap_mwh)
-        throughput_excess_increment = max(0.0, new_excess - prev_excess)
         self._reset_dod_daily_if_needed(hour)
         self._update_dod()
 
@@ -606,6 +537,8 @@ class BESSEnv(gym.Env):
             + revenue_reserve
             - cost_degradation
         )
+        self.daily_throughput += abs(p_battery) * dt
+        
         # === MARKET SPREAD METRICS ===
         price_peak = float(self.day_price_avg_raw if np.isnan(getattr(self, "day_price_avg_raw", np.nan))
                            else max(self._day_prices_raw)) if self._day_prices_raw is not None else price_em
@@ -614,148 +547,87 @@ class BESSEnv(gym.Env):
         daily_range = max(1.0, price_peak - price_low)
         normalized_spread = price_spread / daily_range
 
-        # === ⚙️ Simplified, scaled reward shaping for ideal 2-peak behavior ===
-        # target: charge at cheap/PV hours, discharge at morning/evening peaks,
-        # maintain SOC pre-peak, end near 0.5, and avoid over-cycling.
-        
-        reward_shape = 0.0
-        
-        # Initialize tracking variables for info dict
+        # === SIMPLIFIED REWARD SHAPING (td3_spread version) ===
+        shaping = 0.0
+        peak_discharge_bonus = 0.0
         off_peak_discharge_penalty = 0.0
         cheap_hour_charge_bonus = 0.0
         pv_charge_bonus = 0.0
-        charge_base_bonus = 0.0
         high_price_charge_penalty = 0.0
         terminal_soc_penalty = 0.0
-        peak_soc_guard_penalty = 0.0
-        peak_soc_guard_penalty_morning = 0.0
-        peak_soc_guard_penalty_evening = 0.0
-        empty_battery_penalty = 0.0
-        low_soc_penalty = 0.0
-        charge_reserve_bonus = 0.0
-        soc_deficit_penalty_running = 0.0
         
-        # --- helper metrics ---
-        morning_peak_hours = getattr(self, "morning_peak_hours", set())
-        evening_peak_hours = getattr(self, "evening_peak_hours", set())
-        in_morning_peak = hour in morning_peak_hours
-        in_evening_peak = hour in evening_peak_hours
-        in_peak = in_morning_peak or in_evening_peak
-        pv_to_charge = 0.0
-
+        # Calculate key metrics once
         if self._day_prices_raw is not None and len(self._day_prices_raw) >= 2:
             price_min = float(np.min(self._day_prices_raw))
             price_max = float(np.max(self._day_prices_raw))
-            price_range = max(1.0, price_max - price_min)
-            price_position = (price_em - price_min) / price_range  # 0–1 relative position
-            normalized_action = p_battery / self.P_bess_max         # −1 to +1
-            cheapness = 1.0 - price_position                        # inverse of price position
-            magnitude = max(0.0, -normalized_action)
-            pv_to_charge = min(p_pv_t, -p_battery) if p_battery < 0 else 0.0
-            cheap_window = hour in getattr(self, "cheapest_hours", set())
-
-            if magnitude > 0.0 and not in_peak:
-                base_bonus = self.charge_base_weight * magnitude * max(0.2, cheapness)
-                reward_shape += base_bonus
-                charge_base_bonus = base_bonus
-
-                if cheap_window:
-                    cheap_bonus = self.charge_cheap_boost * magnitude * cheapness
-                    reward_shape += cheap_bonus
-                    cheap_hour_charge_bonus = cheap_bonus
-
-                if pv_to_charge > 0.05:
-                    pv_ratio = min(1.0, pv_to_charge / max(1e-6, -p_battery))
-                    pv_bonus = self.charge_pv_boost * magnitude * pv_ratio
-                    reward_shape += pv_bonus
-                    pv_charge_bonus = pv_bonus
-
-                if price_position > 0.6:
-                    penalty = self.charge_expensive_penalty * magnitude * price_position
-                    reward_shape -= penalty
-                    high_price_charge_penalty = penalty
-
-            # --- off-peak discharge penalty (harder version) ---
-            if p_battery > 0 and not in_peak:
-                offpeak_weight = 0.35   # ↑ stronger than table
-                penalty = offpeak_weight * normalized_action * price_position
-                reward_shape -= penalty
-                off_peak_discharge_penalty = penalty
+            price_range = price_max - price_min
+            price_avg = self.day_price_avg_raw
+            
+            if price_range > 1.0:
+                # Normalized price position: 0 = cheapest, 1 = most expensive
+                price_position = (price_em - price_min) / price_range
+                action_fraction = abs(p_battery) / self.P_bess_max
+                
+                # === DISCHARGE SHAPING ===
+                if p_battery > 0:  # Discharging
+                    if hour in self.peak_hours:
+                        # Bonus for discharging at peaks: scales with price premium and action magnitude
+                        # Use quadratic scaling to encourage full power (0.5 → 0.25x, 1.0 → 1.0x)
+                        magnitude_bonus = (action_fraction) ** 2.0
+                        price_bonus = price_position  # Higher price = higher bonus
+                        # Base: 50 EUR/MW at full power, full price premium
+                        peak_discharge_bonus = 50.0 * price_bonus * magnitude_bonus * p_battery * dt
+                        shaping += peak_discharge_bonus
+                    else:
+                        # Penalty for discharging outside peaks
+                        off_peak_discharge_penalty = 1.5 * p_battery * price_em * dt
+                        shaping -= off_peak_discharge_penalty
+                
+                # === CHARGE SHAPING ===
+                elif p_battery < 0:  # Charging
+                    pv_to_charge = min(p_pv_t, -p_battery)
+                    grid_charge = max(0.0, -p_battery - pv_to_charge)
+                    
+                    # 1. Cheap-hour charge bonus (only if price below average)
+                    if hour in self.cheapest_hours and price_em <= price_avg:
+                        price_discount = 1.0 - price_position  # How cheap (0-1)
+                        magnitude_bonus = (action_fraction) ** 2.0
+                        # Base: 40 EUR/MW at full power, full discount
+                        cheap_hour_charge_bonus = 40.0 * price_discount * magnitude_bonus * abs(p_battery) * dt
+                        shaping += cheap_hour_charge_bonus
+                    
+                    # 2. PV charge bonus (only if price reasonable)
+                    if pv_to_charge > 0.1 and price_em <= price_avg:
+                        pv_fraction = pv_to_charge / max(1e-6, self.P_bess_max)
+                        magnitude_bonus = (pv_fraction) ** 1.5
+                        # Base: 30 EUR/MW of PV used
+                        pv_charge_bonus = 30.0 * magnitude_bonus * pv_to_charge * dt
+                        shaping += pv_charge_bonus
+                    
+                    # 3. High-price charge penalty (consolidated: applies to all charging when expensive)
+                    if price_em > price_avg: 
+                        price_premium = (price_em - price_avg) / max(1.0, price_avg)
+                        # Penalty: 1.0× premium × charge power × price
+                        high_price_charge_penalty = 1.0 * price_premium * abs(p_battery) * price_em * dt
+                        shaping -= high_price_charge_penalty
         
-        # --- pre-peak low-SOC penalty ---
-        k_morn = getattr(self, "k_morn", 6)
-        k_even = getattr(self, "k_even", 18)
-        if k_morn >= 0 and hour < k_morn:
-            target = self.prepeak_morning_target_soc
-            if self.soc < target:
-                deficit = target - self.soc
-                self.soc_deficit_integral_morning = min(
-                    5.0, self.soc_deficit_integral_morning + deficit
-                )
-                penalty = self.prepeak_soc_penalty_coeff * self.soc_deficit_integral_morning
-                reward_shape -= penalty
-                peak_soc_guard_penalty += penalty
-                peak_soc_guard_penalty_morning += penalty
-                soc_deficit_penalty_running += penalty
-            else:
-                self.soc_deficit_integral_morning *= 0.5
-                surplus = min(0.25, self.soc - target)
-                if surplus > 0.0:
-                    bonus = self.prepeak_reserve_bonus_coeff * surplus
-                    reward_shape += bonus
-                    charge_reserve_bonus += bonus
-
-        if k_even >= 0 and 10 <= hour < k_even:
-            target = self.prepeak_evening_target_soc
-            if self.soc < target:
-                deficit = target - self.soc
-                self.soc_deficit_integral_evening = min(
-                    5.0, self.soc_deficit_integral_evening + deficit
-                )
-                penalty = self.prepeak_soc_penalty_coeff * self.soc_deficit_integral_evening
-                reward_shape -= penalty
-                peak_soc_guard_penalty += penalty
-                peak_soc_guard_penalty_evening += penalty
-                soc_deficit_penalty_running += penalty
-            else:
-                self.soc_deficit_integral_evening *= 0.5
-                surplus = min(0.25, self.soc - target)
-                if surplus > 0.0:
-                    bonus = self.prepeak_reserve_bonus_coeff * surplus
-                    reward_shape += bonus
-                    charge_reserve_bonus += bonus
-
-        # --- general low-SOC penalty outside protected windows ---
-        if not in_peak and self.soc < self.general_reserve_floor:
-            deficit = self.general_reserve_floor - self.soc
-            self.low_soc_integral = min(5.0, self.low_soc_integral + deficit)
-            penalty = self.low_soc_penalty_coeff * self.low_soc_integral
-            reward_shape -= penalty
-            low_soc_penalty += penalty
-        else:
-            self.low_soc_integral *= 0.5
-        
-        # --- day-end SOC target (stability) ---
+        # === TERMINAL SOC PENALTY (end of day) ===
         if hour == self.max_hours - 1:
-            soc_error = abs(self.soc - self.target_soc)
-            penalty = self.terminal_soc_penalty_coeff * soc_error
-            reward_shape -= penalty
-            terminal_soc_penalty = penalty
+            soc_deviation = abs(self.soc - 0.5)
+            # Moderate penalty: 2.0 EUR per % deviation per MW capacity
+            terminal_soc_penalty = 4.0 * soc_deviation * self.P_bess_max * price_em * dt
+            shaping -= terminal_soc_penalty
         
-        # --- throughput penalty (optional guard for >2 cycles/day) ---
-        if throughput_excess_increment > 0.0:
-            penalty = 0.05 * (throughput_excess_increment / self.E_capacity)
-            reward_shape -= penalty
+        # Apply shaping to raw reward before normalization
+        shaped_reward = raw_reward + shaping
         
-        # === combine ===
-        # normalize economics to ±1 scale
         if self._day_prices_raw is not None and len(self._day_prices_raw) > 0:
-            price_avg = self.day_price_avg_raw if hasattr(self, 'day_price_avg_raw') and not np.isnan(self.day_price_avg_raw) else float(np.mean(self._day_prices_raw))
+            day_scale = float(np.mean(np.abs(self._day_prices_raw))) * self.P_bess_max * self.dt
+            if day_scale <= 0:
+                day_scale = float(np.maximum(1.0, np.sum(np.abs(self._day_prices_raw)) * self.P_bess_max * self.dt / len(self._day_prices_raw)))
         else:
-            price_avg = max(abs(price_em), 1.0)
-        reward_econ = raw_reward / (price_avg * self.P_bess_max + 1e-6)
-        
-        reward = float(reward_econ + reward_shape)
+            day_scale = float(max(1.0, np.abs(price_em) * self.P_bess_max * self.dt))
+        reward = float(shaped_reward / day_scale)
         # --- 8) Log & advance
         self.episode_revenue += (revenue_pv_grid + revenue_energy + revenue_reserve)
         self.episode_degradation += cost_degradation
@@ -779,19 +651,12 @@ class BESSEnv(gym.Env):
             'cost_degradation': cost_degradation,
             'reward': reward,
             'raw_reward': raw_reward,
-            'reward_shaping': reward_shape,
+            'reward_shaping': shaping,
+            'peak_discharge_bonus': peak_discharge_bonus,
             'off_peak_discharge_penalty': off_peak_discharge_penalty,
             'cheap_hour_charge_bonus': cheap_hour_charge_bonus,
             'pv_charge_bonus': pv_charge_bonus,
-            'charge_base_bonus': charge_base_bonus,
             'high_price_charge_penalty': high_price_charge_penalty,
-            'peak_soc_guard_penalty': peak_soc_guard_penalty,
-            'peak_soc_guard_penalty_morning': peak_soc_guard_penalty_morning,
-            'peak_soc_guard_penalty_evening': peak_soc_guard_penalty_evening,
-            'empty_battery_penalty': empty_battery_penalty,
-            'low_soc_penalty': low_soc_penalty,
-            'charge_reserve_bonus': charge_reserve_bonus,
-            'soc_deficit_penalty_running': soc_deficit_penalty_running,
             'terminal_soc_penalty': terminal_soc_penalty,
             'is_peak_hour': hour in self.peak_hours if hasattr(self, 'peak_hours') else False,
             'is_cheap_hour': hour in self.cheapest_hours if hasattr(self, 'cheapest_hours') else False,

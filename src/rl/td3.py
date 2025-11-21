@@ -86,7 +86,6 @@ class TD3Agent:
         self,
         state_seq: np.ndarray,
         eval_mode: bool = False,
-        action_mask: Optional[Tuple[float, float]] = None,
     ) -> np.ndarray:
         """Return an action for the given state (expects shape [B,T,F])."""
 
@@ -98,10 +97,6 @@ class TD3Agent:
             if not eval_mode:
                 noise = torch.randn_like(action_tensor) * float(self.config.exploration_std)
                 action_tensor = (action_tensor + noise).clamp(self.config.action_low, self.config.action_high)
-
-            if action_mask is not None:
-                low, high = action_mask
-                action_tensor = action_tensor.clamp(float(low), float(high))
 
             action = action_tensor.cpu().numpy()
 
