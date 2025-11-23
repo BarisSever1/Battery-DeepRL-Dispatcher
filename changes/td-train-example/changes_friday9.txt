@@ -1,0 +1,3 @@
+﻿Changes before td3_friday9 training:
+- Boosted peak_reward_norm magnitude: morning peaks now give 0.35 and evening peaks 0.45 per action fraction (post-normalization).
+- Retained raw degradation cost and opportunity-cost inventory rewards from Friday8 setup.
