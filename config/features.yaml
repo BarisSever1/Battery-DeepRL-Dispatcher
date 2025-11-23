@@ -97,7 +97,7 @@ features:
     norm: minmax
     min: -1000
     max: 100000
-/
+
   - key: k_em_max_morning
     desc: Hour index of morning max
     type: int

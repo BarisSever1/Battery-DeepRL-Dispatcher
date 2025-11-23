@@ -61,6 +61,18 @@ features:
     min: 2.150756661127138
     max: 13.81754183931486
     range: 11.666785178187721
+  max_future_price_delta:
+    min: -95.84
+    max: 262.32
+    range: 358.15999999999997
+  avg_future_price_delta:
+    min: -142.915
+    max: 163.67999999999998
+    range: 306.59499999999997
+  peak_hour_price_delta:
+    min: 0.0
+    max: 262.32
+    range: 262.32
   time_to_peak_hour:
     min: 0.0
     max: 21.0
