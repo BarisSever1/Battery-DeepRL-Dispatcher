@@ -539,6 +539,31 @@ class BESSEnv(gym.Env):
         )
         self.daily_throughput += abs(p_battery) * dt
         
+        # --- Opportunity cost of inventory relative to next peak ---
+        next_peak_hour = None
+        if hasattr(self, "peak_hours"):
+            for h in sorted(self.peak_hours):
+                if h >= hour:
+                    next_peak_hour = h
+                    break
+            if next_peak_hour is None and self.peak_hours:
+                next_peak_hour = max(self.peak_hours)
+
+        if (
+            next_peak_hour is not None
+            and self._day_prices_raw is not None
+            and 0 <= next_peak_hour < len(self._day_prices_raw)
+        ):
+            next_peak_price = float(self._day_prices_raw[next_peak_hour])
+        else:
+            next_peak_price = price_em
+
+        energy_change_mwh = (self.soc - self.soc_previous) * self.E_capacity
+        inventory_reward = energy_change_mwh * (next_peak_price - price_em)
+        peak_value_denom = max(1e-6, self.P_bess_max * getattr(self, "day_price_avg_raw", price_em))
+        inventory_reward_norm = inventory_reward / peak_value_denom
+
+        # Encourage holding when peak is soon, penalize dumping right before peak
         # === MARKET SPREAD METRICS ===
         price_peak = float(self.day_price_avg_raw if np.isnan(getattr(self, "day_price_avg_raw", np.nan))
                            else max(self._day_prices_raw)) if self._day_prices_raw is not None else price_em
@@ -548,7 +573,7 @@ class BESSEnv(gym.Env):
         normalized_spread = price_spread / daily_range
 
         # === SIMPLIFIED REWARD SHAPING (td3_spread version) ===
-        shaping = 0.0
+        shaping = inventory_reward
         peak_discharge_bonus = 0.0
         off_peak_discharge_penalty = 0.0
         cheap_hour_charge_bonus = 0.0
@@ -621,6 +646,8 @@ class BESSEnv(gym.Env):
         # Apply shaping to raw reward before normalization
         shaped_reward = raw_reward + shaping
         
+        #normalize the reward by the day scale
+        
         if self._day_prices_raw is not None and len(self._day_prices_raw) > 0:
             day_scale = float(np.mean(np.abs(self._day_prices_raw))) * self.P_bess_max * self.dt
             if day_scale <= 0:
@@ -628,6 +655,30 @@ class BESSEnv(gym.Env):
         else:
             day_scale = float(max(1.0, np.abs(price_em) * self.P_bess_max * self.dt))
         reward = float(shaped_reward / day_scale)
+
+        # After normalizing the reward, we add a peak reward norm to encourage full discharge at peaks
+        peak_reward_norm = 0.0
+        peak_hours = getattr(self, "peak_hours", set())
+        if hour in peak_hours:
+            action_fraction = abs(p_battery) / max(1e-6, self.P_bess_max)
+            mor_hours = getattr(self, "morning_peak_hours", set())
+            eve_hours = getattr(self, "evening_peak_hours", set())
+            if p_battery > 0:
+                # Base bonus for any positive discharge during peak
+                if hour in eve_hours:
+                    base_bonus = 0.4
+                elif hour in mor_hours:
+                    base_bonus = 0.3
+                else:
+                    base_bonus = 0.2
+                peak_reward_norm = base_bonus + 0.3 * action_fraction
+            else:
+                # Penalty for failing to discharge when SOC is available
+                if self.soc > (self.soc_min + 0.05):
+                    peak_reward_norm = -0.25
+            reward += peak_reward_norm
+
+
         # --- 8) Log & advance
         self.episode_revenue += (revenue_pv_grid + revenue_energy + revenue_reserve)
         self.episode_degradation += cost_degradation
@@ -649,6 +700,10 @@ class BESSEnv(gym.Env):
             'revenue_energy': revenue_energy,
             'revenue_reserve': revenue_reserve,
             'cost_degradation': cost_degradation,
+            'inventory_reward': inventory_reward,
+            'inventory_reward_norm': inventory_reward_norm,
+            'next_peak_price': next_peak_price,
+            'peak_reward_norm': peak_reward_norm,
             'reward': reward,
             'raw_reward': raw_reward,
             'reward_shaping': shaping,
