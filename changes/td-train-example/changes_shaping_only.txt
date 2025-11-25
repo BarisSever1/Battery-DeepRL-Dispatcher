@@ -1,0 +1,7 @@
+Changes before td3_shaping_only training:
+- Enforced pure reward shaping: raw economics (PV/grid revenue and degradation) remain logged but never contribute to the reward signal. Rewards now equal the clipped shaping sum only.
+- Added SOC-based soft constraints and ΔSOC/energy-driven incentives: cheap/expensive bonuses, cheap-slot bonuses, wrong-discharge penalties, peak boosts, pre-peak guidance, idle-flatness bonus, terminal SOC target, and fallback cheap-hour set when prices are flat.
+- Normalized every shaping component by 1/sqrt(E_capacity) and clipped the final reward to ±8 after NaN/inf safety checks; logged raw shaping magnitude plus scale factor for diagnostics.
+- Extended info dict diagnostics with `shaping_terms`, `shaping_raw`, `shaping_scale`, `delta_soc`, `energy_mwh`, peak countdown, mode flag, and price factors so eval/training logs match exactly.
+- Updated TD3/evaluation plumbing to consume `reward_shaping` directly, ensuring training, quick eval, and comprehensive eval all see the same pure-shaping reward stream.
+

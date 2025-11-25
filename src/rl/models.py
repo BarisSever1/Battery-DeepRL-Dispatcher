@@ -86,8 +86,8 @@ class ActorLSTM(nn.Module):
         raw_action = self.head(features)
         # Output action in [-1, 1] range (tanh already provides this range)
         # TD3 fix: return only last timestep action
-        action = torch.tanh(raw_action[:, -1:, :])  # shape [B,1,1], range [-1, 1]
-        return action, hidden_out
+        actions = torch.tanh(raw_action)  # shape [B,T,1], range [-1, 1]
+        return actions, hidden_out
 
 
 class _CriticHead(nn.Module):

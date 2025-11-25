@@ -1,0 +1,32 @@
+﻿# Changes for td3_tuesday7 (Time-Aware Cycling)
+
+## Date: Tuesday Nov 25, 2025
+
+## Problem
+- Agent was cycling shallowly all the time
+- Flat cycling penalty discouraged ALL cycling equally
+- Agent became timid everywhere instead of just during off-peak hours
+
+## Solution: Time-Aware Cycling Penalty
+
+### Removed:
+- Flat daily throughput cycling penalty (penalized all cycling)
+
+### Added:
+1. **Time-Aware Cycling Penalty**
+   - Only penalize cycling during "wrong" times
+   - Good cycling times (no penalty):
+     - Discharging when expensive (expensive_factor > 0.6)
+     - Charging when cheap (cheap_factor > 0.5)
+   - Wrong times: 0.5 EUR/MWh penalty
+
+2. **Idle Bonus During Mid-Price Hours**
+   - Mid-price defined as: 0.3 < expensive_factor < 0.6
+   - +0.3 bonus for staying nearly idle (|p_battery| < 1.0 MW)
+   - Encourages holding during ambiguous price hours
+
+## Expected Behavior
+- Hard cycling during peak discharge windows
+- Hard cycling during cheap charge windows
+- Idle/shallow cycling during mid-price hours
+- No more blanket timidity from flat cycling penalty

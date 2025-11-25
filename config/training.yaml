@@ -2,7 +2,7 @@
 
 algorithm:
   name: TD3
-  gamma: 0.99             # slightly sub-1 for smoother temporal credit
+  gamma: 1            # slightly sub-1 for smoother temporal credit
   tau: 0.005              # Polyak (slower target updates for stability)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)

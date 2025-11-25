@@ -146,27 +146,30 @@ class ReplayBuffer:
             n = self.n_step
 
             for b in range(B):
+                base_buf_index = indices[b]
                 for t in range(T):
                     G = 0.0
                     g = 1.0
                     done_flag = 0.0
-                    next_state_idx = t  # will be updated to t+k where the rollout ends
+
+                    start_idx = (base_buf_index - (T - 1 - t)) % self.capacity
+                    final_idx = start_idx
+
                     for k in range(n):
-                        tk = t + k
-                        if tk >= T:
-                            break
-                        G += g * rewards[b, tk]
-                        next_state_idx = tk
-                        if dones[b, tk] > 0.5:
+                        idx_k = (start_idx + k) % self.capacity
+                        G += g * self.rewards[idx_k]
+                        final_idx = idx_k
+                        if self.dones[idx_k] > 0.5:
                             done_flag = 1.0
                             break
                         g *= gamma
+
                     n_step_rewards[b, t] = G
                     n_step_dones[b, t] = done_flag
-                    n_step_next_states[b, t] = next_states[b, next_state_idx]
+                    n_step_next_states[b, t] = self.next_states[final_idx]
 
-            batch["n_step_rewards"] = n_step_rewards
-            batch["n_step_dones"] = n_step_dones
+            batch["n_step_rewards"] = n_step_rewards[..., None]
+            batch["n_step_dones"] = n_step_dones[..., None]
             batch["n_step_next_states"] = n_step_next_states
 
         return batch

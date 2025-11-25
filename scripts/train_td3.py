@@ -183,10 +183,23 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
         if len(obs_history) > history_len:
             obs_history.pop(0)
         state_seq = _np.asarray(obs_history, dtype=_np.float32)[ _np.newaxis, :, :]  # [1,T,F]
-        action_seq = agent.act(state_seq, eval_mode=True)
-        action = float(action_seq[0, -1, 0])
+        action_vec = agent.act(state_seq, eval_mode=True)[0]
+        action_arr = _np.asarray(action_vec, dtype=_np.float32)
 
-        next_obs, reward, terminated, truncated, info = env.step(_np.array([action], dtype=_np.float32))
+        q1_value = float("nan")
+        q2_value = float("nan")
+        try:
+            with torch.no_grad():
+                state_seq_t = torch.as_tensor(state_seq, dtype=torch.float32, device=agent.device)
+                action_last_t = torch.as_tensor(action_arr.reshape(1, 1, -1), dtype=torch.float32, device=agent.device)
+                action_seq_t = action_last_t.expand(-1, state_seq_t.shape[1], -1)
+                q1_eval, q2_eval = agent.critic(state_seq_t, action_seq_t)
+                q1_value = float(q1_eval.outputs[:, -1, :].view(1, -1).mean().item())
+                q2_value = float(q2_eval.outputs[:, -1, :].view(1, -1).mean().item())
+        except Exception:
+            q1_value = float("nan")
+            q2_value = float("nan")
+        next_obs, reward, terminated, truncated, info = env.step(action_arr)
 
         soc = float(info.get("soc", env.soc))
         soc_before = float(info.get("soc_before", env.soc))
@@ -203,10 +216,11 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
         # Denormalized feature snapshot
         obs_features = _denorm_obs_features(env, obs_vec, soc_before)
 
+        action_scalar = float(action_arr[0]) if action_arr.size > 0 else float(action_arr)
         rows.append({
             "hour": info.get("hour", step),
-            "action": action,
-            "delta": float(info.get("delta", action)),
+            "action": action_scalar,
+            "delta": float(info.get("delta", action_scalar)),
             "soc": soc,
             "soc_before": soc_before,
             "dod_morning": float(info.get("dod_morning", 0.0)),
@@ -223,9 +237,19 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
             "revenue_reserve": float(info.get("revenue_reserve", 0.0)),
             "degradation_cost": float(info.get("cost_degradation", 0.0)),
             "reward": float(reward),
+            "reward_base": float(info.get("reward_base", info.get("raw_reward", 0.0))),
+            "reward_with_shaping": float(info.get("reward_with_shaping", info.get("raw_reward", 0.0) + info.get("reward_shaping", 0.0))),
+            "reward_final": float(info.get("reward_final", reward)),
+            "reward_shaping_component": float(info.get("reward_shaping", 0.0)),
+            "q1_eval": q1_value,
+            "q2_eval": q2_value,
             "cumulative_revenue": cumulative_revenue,
             "cumulative_degradation": cumulative_degradation,
             "cumulative_profit": cumulative_profit,
+            "future_price_trend": float(info.get("future_price_trend", 0.0)),
+            "delta_to_morning_peak": float(info.get("delta_to_morning_peak", 0.0)),
+            "delta_to_evening_peak": float(info.get("delta_to_evening_peak", 0.0)),
+            "time_to_peak_hour_raw": float(info.get("time_to_peak_hour_raw", info.get("time_to_peak_hour", 0.0))),
             **obs_features,
         })
 
@@ -319,6 +343,15 @@ def main() -> None:
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     csv_writer = initialize_csv(args.csv_log) if args.csv_log else None
 
+    training_metrics_path = None
+    if args.quick_eval_outdir:
+        args.quick_eval_outdir.mkdir(parents=True, exist_ok=True)
+        training_metrics_path = args.quick_eval_outdir / "training_metrics.jsonl"
+        try:
+            training_metrics_path.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
     episode_returns: List[float] = []
     print(f"Using device={device}, seed={args.seed}")
     print(f"Starting training on device {device} with {total_episodes} episodes")
@@ -345,6 +378,7 @@ def main() -> None:
                     "cost_degradation": 0.0,
                 }
                 step_info: Dict[str, float] = {}
+                episode_update_stats: List[Dict[str, float]] = []
 
                 step = 0
                 # Maintain full observation history within the episode
@@ -359,12 +393,11 @@ def main() -> None:
                         action = env.action_space.sample().astype(np.float32)
                     else:
                         state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
-                        action_seq = agent.act(
+                        action_vec = agent.act(
                             state_seq,
                             eval_mode=args.eval_mode,
-                        )  # [1, T, A]
-                        last_action = action_seq[0, -1]  # take action for the latest timestep, shape [A]
-                        action = np.asarray(last_action, dtype=np.float32)
+                        )[0]
+                        action = np.asarray(action_vec, dtype=np.float32)
 
                     next_obs, reward, terminated, truncated, step_info = env.step(action)
 
@@ -382,13 +415,33 @@ def main() -> None:
 
                     if len(buffer) >= args.warmup_steps:
                         for _ in range(args.updates_per_step):
-                            agent.update(buffer, batch_size=args.batch_size, seq_len=args.seq_len)
+                            stats = agent.update(buffer, batch_size=args.batch_size, seq_len=args.seq_len)
+                            episode_update_stats.append(stats)
 
                 # Episode finished
                 episode_returns.append(episode_return)
                 episode_profit = step_info.get("episode_profit", episode_return)
                 episode_revenue = step_info.get("episode_revenue", metrics_accumulator["revenue_pv_grid"] + metrics_accumulator["revenue_energy"] + metrics_accumulator["revenue_reserve"])
                 episode_degradation = step_info.get("episode_degradation", metrics_accumulator["cost_degradation"])
+
+                if training_metrics_path is not None:
+                    def _avg(key: str) -> float:
+                        vals = [float(s.get(key, float("nan"))) for s in episode_update_stats if key in s]
+                        return float(sum(vals) / len(vals)) if vals else float("nan")
+
+                    metrics_entry = {
+                        "episode": episode_counter,
+                        "critic_loss": _avg("critic_loss"),
+                        "actor_loss": _avg("actor_loss"),
+                        "q1_mean": _avg("q1_mean"),
+                        "q2_mean": _avg("q2_mean"),
+                    }
+                    try:
+                        with training_metrics_path.open("a", encoding="utf-8") as tm_file:
+                            json.dump(metrics_entry, tm_file)
+                            tm_file.write("\n")
+                    except Exception:
+                        pass
 
                 if csv_writer is not None:
                     csv_writer.writerow(

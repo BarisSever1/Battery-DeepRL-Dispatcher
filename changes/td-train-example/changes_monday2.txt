@@ -1,0 +1,8 @@
+﻿Changes before td3_monday2 training:
+- Reward shaping weights now combine fixed base + proportional parts:
+  * Peak bonuses: base 35 â‚¬/MW + 110 â‚¬/MW scaled by power * price premium.
+  * Off-peak penalties: base 2.5 â‚¬/MW + 35 â‚¬/MWh scaled by absolute discharge.
+  * Cheap-hour bonuses: base 6 â‚¬/MW + 24 â‚¬/MW scaled by action fraction.
+  * PV bonuses: base 4 â‚¬/MW + 16 â‚¬/MW scaled by PV fraction.
+  * High-price charge penalty: base 12 â‚¬/MW + 45 â‚¬/MWh scaled by power.
+- Post-normalization peak reward: base (0.3 morning / 0.4 evening / 0.2 other) + 0.3Ă—action_fraction when discharging, with -0.25 penalty if SOC>min+5% and not discharging.

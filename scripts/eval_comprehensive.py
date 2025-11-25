@@ -59,6 +59,10 @@ class HourlyData:
     revenue_reserve: float  # Revenue from reserve provision
     degradation_cost: float  # Battery degradation cost
     reward: float  # Step reward (revenue - degradation)
+    reward_base: float  # Raw market reward prior to shaping
+    reward_with_shaping: float  # Reward after adding shaping signals (pre-normalization)
+    reward_final: float  # Final reward passed to learner (post-normalization if any)
+    reward_shaping_component: float  # Net contribution from shaping terms
     
     # Cumulative metrics (EUR)
     cumulative_revenue: float
@@ -83,6 +87,10 @@ class HourlyData:
     price_as_min: float  # Daily reserve min (EUR/MW·h, raw)
     price_as_max: float  # Daily reserve max (EUR/MW·h, raw)
     time_to_peak_hour: float
+    future_price_trend: float  # Future 6h average minus current price (EUR/MWh)
+    delta_to_morning_peak: float  # Price gap to upcoming morning peak (EUR/MWh)
+    delta_to_evening_peak: float  # Price gap to upcoming evening peak (EUR/MWh)
+    time_to_peak_hour_raw: float  # Direct hours until next peak (capped placeholder)
 
 
 @dataclass
@@ -132,7 +140,7 @@ def load_test_dates(test_data_path: str) -> List:
 
 
 def denormalize_observation_features(
-    env: BESSEnv, obs_vec: np.ndarray, soc: float, dod: Optional[float] = None
+    env: BESSEnv, obs_vec: np.ndarray
 ) -> Dict[str, float]:
     """
     Denormalize the core observation features (first 17) to raw values.
@@ -179,16 +187,9 @@ def denormalize_observation_features(
         norm_value = float(obs_vec[i])
         
         if feature_name == "soc":
-            # Inverse of: normalized = 2.0 * soc - 1.0
-            # Use provided soc if available (more accurate), otherwise denormalize
-            denormalized["soc_raw"] = soc if soc is not None else (norm_value + 1.0) / 2.0
+            denormalized["soc_raw"] = (norm_value + 1.0) / 2.0
         elif feature_name == "dod":
-            # Inverse of: normalized = 2.0 * dod - 1.0
-            # Use provided dod if available, otherwise denormalize from observation
-            if dod is not None:
-                denormalized["dod_raw"] = dod
-            else:
-                denormalized["dod_raw"] = (norm_value + 1.0) / 2.0
+            denormalized["dod_raw"] = (norm_value + 1.0) / 2.0
         else:
             # Denormalize using environment's method
             raw_value = env._denormalize(feature_name, norm_value)
@@ -217,7 +218,11 @@ def evaluate_td3_agent(
     hourly_data_list: List[List[HourlyData]] = []
     np.random.seed(seed)
 
+    EVAL_SEQ_LEN = 24
+
     for date in test_dates:
+        if hasattr(agent.actor, "reset_hidden_state"):
+            agent.actor.reset_hidden_state(batch_size=1)
         # Reset environment with specific date
         obs, _ = env.reset(seed=seed, options={"date": date})
         obs_vec = np.asarray(obs, dtype=np.float32)
@@ -247,18 +252,25 @@ def evaluate_td3_agent(
         while not done:
             # Append current observation to history and feed full sequence to the actor
             obs_history.append(obs_vec)
-            # Truncate to 12 for consistency with training sequence length
-            if len(obs_history) > 12:
-                obs_history.pop(0)
-            state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
-            action_seq = agent.act(state_seq, eval_mode=True)  # [1, T, 1]
-            action = float(action_seq[0, -1, 0])  # take action for the latest timestep
-            action_values.append(float(action))
+            if len(obs_history) > EVAL_SEQ_LEN:
+                obs_history = obs_history[-EVAL_SEQ_LEN:]
+            seq_len = EVAL_SEQ_LEN
+            seq = np.zeros((1, seq_len, obs_vec.shape[-1]), dtype=np.float32)
+            seq[0, -len(obs_history):, :] = np.asarray(obs_history, dtype=np.float32)
+            try:
+                action_vec = agent.act(seq, eval_mode=True)[0]
+            except Exception:
+                seq_t = np.transpose(seq, (1, 0, 2))
+                action_vec = agent.act(seq_t, eval_mode=True)[0]
+            if isinstance(action_vec, torch.Tensor):
+                action_array = action_vec.detach().cpu().numpy().astype(np.float32)
+            else:
+                action_array = np.asarray(action_vec, dtype=np.float32)
+            action_scalar = float(action_array[0]) if action_array.size > 0 else float(action_array)
+            action_values.append(action_scalar)
 
             # Step environment
-            next_obs, reward, terminated, truncated, info = env.step(
-                np.array([action], dtype=np.float32)
-            )
+            next_obs, reward, terminated, truncated, info = env.step(action_array)
 
             # Collect metrics
             hour = info.get("hour", step)
@@ -276,7 +288,11 @@ def evaluate_td3_agent(
             # The agent and environment still use normalized values internally.
             # This denormalization happens AFTER the step, so it doesn't affect evaluation.
             # obs_vec contains the normalized state the agent saw before taking the action
-            obs_features = denormalize_observation_features(env, obs_vec, soc_before, None)
+            obs_features = denormalize_observation_features(env, obs_vec)
+            obs_features["future_price_trend"] = float(info.get("future_price_trend", 0.0))
+            obs_features["delta_to_morning_peak"] = float(info.get("delta_to_morning_peak", 0.0))
+            obs_features["delta_to_evening_peak"] = float(info.get("delta_to_evening_peak", 0.0))
+            obs_features["time_to_peak_hour_raw"] = float(info.get("time_to_peak_hour_raw", obs_features.get("time_to_peak_hour", 0.0)))
 
             # Update cumulative totals
             totals["revenue_pv"] += info.get("revenue_pv_grid", 0.0)
@@ -289,12 +305,14 @@ def evaluate_td3_agent(
             cumulative_degradation = totals["degradation"]
             cumulative_profit = cumulative_revenue - cumulative_degradation
 
+            reward = float(info.get("reward_final", info.get("reward", reward)))
+
             # Store comprehensive hourly data
             hourly_data.append(
                 HourlyData(
                     hour=hour,
-                    action=float(action),
-                    delta=float(info.get("delta", action)),
+                    action=action_scalar,
+                    delta=float(info.get("delta", action_scalar)),
                     is_discharge_slot=bool(info.get("is_discharge_slot", False)),
                     soc=soc,
                     soc_before=soc_before,
@@ -311,7 +329,11 @@ def evaluate_td3_agent(
                     revenue_energy=float(info.get("revenue_energy", 0.0)),
                     revenue_reserve=float(info.get("revenue_reserve", 0.0)),
                     degradation_cost=float(info.get("cost_degradation", 0.0)),
-                    reward=float(reward),
+                    reward=reward,
+                    reward_base=float(info.get("reward_base", 0.0)),
+                    reward_with_shaping=float(info.get("reward_shaping", reward)),
+                    reward_final=float(info.get("reward_final", reward)),
+                    reward_shaping_component=float(info.get("reward_shaping", reward)),
                     cumulative_revenue=cumulative_revenue,
                     cumulative_degradation=cumulative_degradation,
                     cumulative_profit=cumulative_profit,
@@ -355,7 +377,7 @@ def evaluate_td3_agent(
 
         # Operational metrics
         action_mean = float(np.mean(action_values)) if action_values else 0.0
-        discharge_hours = sum(1 for p in p_battery_values if p < 0)
+        discharge_hours = sum(1 for p in p_battery_values if p > 0)
 
         stats = ComprehensiveStats(
             profit=profit,
@@ -398,6 +420,7 @@ def evaluate_baseline_comprehensive(
         # Reset environment with specific date
         obs, _ = env.reset(seed=seed, options={"date": date})
         obs_vec = np.asarray(obs, dtype=np.float32)
+        obs_history = [obs_vec]
 
         # Get plan from baseline policy
         plan = plan_fn(env, seed)
@@ -439,7 +462,11 @@ def evaluate_baseline_comprehensive(
             # The agent and environment still use normalized values internally.
             # This denormalization happens AFTER the step, so it doesn't affect evaluation.
             # obs_vec contains the normalized state the agent saw before taking the action
-            obs_features = denormalize_observation_features(env, obs_vec, soc_before, None)
+            obs_features = denormalize_observation_features(env, obs_vec)
+            obs_features["future_price_trend"] = float(info.get("future_price_trend", 0.0))
+            obs_features["delta_to_morning_peak"] = float(info.get("delta_to_morning_peak", 0.0))
+            obs_features["delta_to_evening_peak"] = float(info.get("delta_to_evening_peak", 0.0))
+            obs_features["time_to_peak_hour_raw"] = float(info.get("time_to_peak_hour_raw", obs_features.get("time_to_peak_hour", 0.0)))
 
             # Update cumulative totals
             totals["revenue_pv"] += info.get("revenue_pv_grid", 0.0)
@@ -451,6 +478,8 @@ def evaluate_baseline_comprehensive(
             )
             cumulative_degradation = totals["degradation"]
             cumulative_profit = cumulative_revenue - cumulative_degradation
+
+            reward = float(info.get("reward_shaping", info.get("reward", reward)))
 
             # Store comprehensive hourly data
             hourly_data.append(
@@ -474,7 +503,11 @@ def evaluate_baseline_comprehensive(
                     revenue_energy=float(info.get("revenue_energy", 0.0)),
                     revenue_reserve=float(info.get("revenue_reserve", 0.0)),
                     degradation_cost=float(info.get("cost_degradation", 0.0)),
-                    reward=float(reward),
+                    reward=reward,
+                    reward_base=float(info.get("reward_base", 0.0)),
+                    reward_with_shaping=float(info.get("reward_shaping", reward)),
+                    reward_final=float(info.get("reward_final", reward)),
+                    reward_shaping_component=float(info.get("reward_shaping", reward)),
                     cumulative_revenue=cumulative_revenue,
                     cumulative_degradation=cumulative_degradation,
                     cumulative_profit=cumulative_profit,
@@ -483,7 +516,10 @@ def evaluate_baseline_comprehensive(
             )
 
             final_info = info
-            obs_vec = np.asarray(next_obs, dtype=np.float32)
+            obs_history.append(np.asarray(next_obs, dtype=np.float32))
+            if len(obs_history) > 1:
+                obs_history = obs_history[-1:]
+            obs_vec = obs_history[-1]
             if terminated or truncated:
                 break
 
@@ -510,7 +546,7 @@ def evaluate_baseline_comprehensive(
         charge_cycles = energy_throughput_mwh / (capacity_mwh * avg_dod) if avg_dod > 0 else 0.0
 
         action_mean = float(np.mean(action_values)) if action_values else 0.0
-        discharge_hours = sum(1 for p in p_battery_values if p < 0)
+        discharge_hours = sum(1 for p in p_battery_values if p > 0)
 
         stats = ComprehensiveStats(
             profit=profit,

@@ -87,20 +87,29 @@ class TD3Agent:
         state_seq: np.ndarray,
         eval_mode: bool = False,
     ) -> np.ndarray:
-        """Return an action for the given state (expects shape [B,T,F])."""
+        """Return an action for the given state history (expects shape [B,T,F])."""
 
         self.actor.eval()
         with torch.no_grad():
             state_tensor = torch.as_tensor(state_seq, dtype=torch.float32, device=self.device)
-            action_tensor, _ = self.actor(state_tensor)
+            action_seq, hidden = self.actor(state_tensor)
+            hidden = tuple(h.detach() for h in hidden)
+
+            if action_seq.dim() == 2:  # [B,A] -> [B,1,A]
+                action_seq = action_seq.unsqueeze(1)
+
+            actions_last = action_seq[:, -1:, :]  # [B,1,A]
 
             if not eval_mode:
-                noise = torch.randn_like(action_tensor) * float(self.config.exploration_std)
-                action_tensor = (action_tensor + noise).clamp(self.config.action_low, self.config.action_high)
+                noise = torch.randn_like(actions_last) * float(self.config.exploration_std)
+                noise = noise.clamp(-self.config.noise_clip, self.config.noise_clip)
+                actions_last = actions_last + noise
 
-            action = action_tensor.cpu().numpy()
+            actions_last = actions_last.clamp(self.config.action_low, self.config.action_high)
+            actions_np = actions_last.squeeze(1).cpu().numpy()
 
-        return action
+        self.actor.train()
+        return actions_np
 
     # ------------------------------------------------------------------
     # Training
@@ -110,123 +119,88 @@ class TD3Agent:
         self.total_it += 1
 
         batch = buffer.sample(batch_size, seq_len=seq_len)
-        states = torch.as_tensor(batch["states"], dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(batch["actions"], dtype=torch.float32, device=self.device)
+        states_seq = torch.as_tensor(batch["states"], dtype=torch.float32, device=self.device)
+        actions_seq = torch.as_tensor(batch["actions"], dtype=torch.float32, device=self.device)
         rewards_raw = torch.as_tensor(batch["rewards"], dtype=torch.float32, device=self.device)
-        next_states = torch.as_tensor(batch["next_states"], dtype=torch.float32, device=self.device)
+        next_states_seq = torch.as_tensor(batch["next_states"], dtype=torch.float32, device=self.device)
         dones_raw = torch.as_tensor(batch["dones"], dtype=torch.float32, device=self.device)
-        
-        # Extract only the last timestep (t = seq_len-1) for rewards and dones
-        # Handle both [B, T] and [B, T, 1] shapes
-        if rewards_raw.dim() == 2:
-            rewards_last = rewards_raw[:, -1:].clone()  # [B, 1]
-        else:
-            rewards_last = rewards_raw[:, -1, :].clone().unsqueeze(-1)  # [B, 1]
-        
-        if dones_raw.dim() == 2:
-            dones_last = dones_raw[:, -1:].clone()  # [B, 1]
-        else:
-            dones_last = dones_raw[:, -1, :].clone().unsqueeze(-1)  # [B, 1]
-        
-        # Keep full sequences for states/actions (needed for LSTM)
-        states_seq = states
-        next_states_seq = next_states
-        actions_seq = actions
+        seq_len_actual = states_seq.shape[1]
+
+        def _last_step(t: Tensor) -> Tensor:
+            if t.dim() == 3:
+                return t[:, -1, :].view(t.size(0), -1)
+            if t.dim() == 2:
+                return t[:, -1].view(t.size(0), 1)
+            if t.dim() == 1:
+                return t.view(t.size(0), 1)
+            raise ValueError("Unexpected tensor rank")
+
+        rewards_last = _last_step(rewards_raw)
+        dones_last = _last_step(dones_raw)
+
+        use_n_step = self.config.use_n_step and "n_step_rewards" in batch
+        gamma_factor = self.config.gamma
+        target_state_seq = next_states_seq
+
+        if use_n_step:
+            n_rewards_raw = torch.as_tensor(batch["n_step_rewards"], dtype=torch.float32, device=self.device)
+            n_dones_raw = torch.as_tensor(batch["n_step_dones"], dtype=torch.float32, device=self.device)
+            n_next_states_raw = torch.as_tensor(batch["n_step_next_states"], dtype=torch.float32, device=self.device)
+            rewards_last = _last_step(n_rewards_raw)
+            dones_last = _last_step(n_dones_raw)
+            target_state_seq = n_next_states_raw
+            gamma_factor = self.config.gamma ** self.config.n_step
+
+        batch_size = states_seq.size(0)
+
+        actions_last = actions_seq[:, -1:, :].clone()
+        actions_broadcast = actions_last.expand(-1, seq_len_actual, -1)
 
         with torch.no_grad():
-            # Optionally use n-step targets
-            if self.config.use_n_step and "n_step_rewards" in batch:
-                n_rewards_raw = torch.as_tensor(batch["n_step_rewards"], dtype=torch.float32, device=self.device)
-                n_dones_raw = torch.as_tensor(batch["n_step_dones"], dtype=torch.float32, device=self.device)
-                n_next_states_raw = torch.as_tensor(batch["n_step_next_states"], dtype=torch.float32, device=self.device)
-                
-                # Extract only the last timestep for n-step returns
-                if n_rewards_raw.dim() == 2:
-                    n_rewards_last = n_rewards_raw[:, -1:].clone()  # [B, 1]
-                else:
-                    n_rewards_last = n_rewards_raw[:, -1, :].clone().unsqueeze(-1)  # [B, 1]
-                
-                if n_dones_raw.dim() == 2:
-                    n_dones_last = n_dones_raw[:, -1:].clone()  # [B, 1]
-                else:
-                    n_dones_last = n_dones_raw[:, -1, :].clone().unsqueeze(-1)  # [B, 1]
-                
-                # Use full sequence for next_states (needed for LSTM)
-                n_next_states_seq = n_next_states_raw
+            next_actions_full, hidden_next = self.actor_target(target_state_seq)
+            hidden_next = tuple(h.detach() for h in hidden_next)
+            if next_actions_full.dim() == 2:
+                next_actions_full = next_actions_full.unsqueeze(1)
+            next_actions_last = next_actions_full[:, -1:, :]
+            target_noise = torch.randn_like(next_actions_last) * self.config.target_std
+            target_noise = target_noise.clamp(-self.config.noise_clip, self.config.noise_clip)
+            next_actions_last = next_actions_last + target_noise
+            next_actions_last = next_actions_last.clamp(self.config.action_low, self.config.action_high)
+            target_seq_len = target_state_seq.shape[1]
+            next_actions_seq = next_actions_last.expand(-1, target_seq_len, -1)
 
-                next_actions, hidden_next = self.actor_target(n_next_states_seq)
-                # Detach hidden states to prevent gradient flow
-                hidden_next = tuple(h.detach() for h in hidden_next)
-                target_noise = torch.clamp(
-                    torch.randn_like(next_actions) * self.config.target_std,
-                    -self.config.noise_clip,
-                    self.config.noise_clip,
-                )
-                next_actions = (next_actions + target_noise).clamp(
-                    self.config.action_low,
-                    self.config.action_high,
-                )
-                q1_next, q2_next = self.critic_target(n_next_states_seq, next_actions)
-                # TD3 fix: use only last timestep Q-values
-                min_q_next = torch.min(q1_next.outputs[:, -1, :], q2_next.outputs[:, -1, :])
+            q1_next, q2_next = self.critic_target(target_state_seq, next_actions_seq)
+            q1_next_hidden = tuple(h.detach() for h in q1_next.hidden)
+            q2_next_hidden = tuple(h.detach() for h in q2_next.hidden)
+            min_q_next = torch.min(q1_next.outputs[:, -1, :], q2_next.outputs[:, -1, :]).view(batch_size, 1)
+            target_q = rewards_last + (1.0 - dones_last) * gamma_factor * min_q_next
+            target_q = target_q.view(batch_size, 1)
 
-                gamma_n = (self.config.gamma ** self.config.n_step)
-                target_q = n_rewards_last + (1.0 - n_dones_last) * gamma_n * min_q_next
-            else:
-                next_actions, hidden_next = self.actor_target(next_states_seq)
-                # Detach hidden states to prevent gradient flow
-                hidden_next = tuple(h.detach() for h in hidden_next)
-                target_noise = torch.clamp(
-                    torch.randn_like(next_actions) * self.config.target_std,
-                    -self.config.noise_clip,
-                    self.config.noise_clip,
-                )
-                next_actions = (next_actions + target_noise).clamp(
-                    self.config.action_low,
-                    self.config.action_high,
-                )
-
-                q1_next, q2_next = self.critic_target(next_states_seq, next_actions)
-                # TD3 fix: use only last timestep Q-values
-                q1_next_values = q1_next.outputs[:, -1, :]
-                q2_next_values = q2_next.outputs[:, -1, :]
-                min_q_next = torch.min(q1_next_values, q2_next_values)
-                target_q = rewards_last + (1.0 - dones_last) * self.config.gamma * min_q_next
-
-        q1_current, q2_current = self.critic(states_seq, actions_seq)
-        # TD3 fix: compute loss only on last timestep
-        q1_last = q1_current.outputs[:, -1, :]
-        q2_last = q2_current.outputs[:, -1, :]
-        target_last = target_q
-        q1_loss = nn.functional.mse_loss(q1_last, target_last)
-        q2_loss = nn.functional.mse_loss(q2_last, target_last)
-        critic_loss = q1_loss + q2_loss
+        q1_current, q2_current = self.critic(states_seq, actions_broadcast)
+        q1_last = q1_current.outputs[:, -1, :].view(batch_size, 1)
+        q2_last = q2_current.outputs[:, -1, :].view(batch_size, 1)
+        critic_loss = nn.functional.mse_loss(q1_last, target_q) + nn.functional.mse_loss(q2_last, target_q)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
-        actor_loss = torch.tensor(0.0, device=self.device)
+        actor_loss = torch.zeros(1, device=self.device)
         if self.total_it % self.config.policy_delay == 0:
-            for param in self.critic.parameters():
-                param.requires_grad = False
-
-            actor_actions, hidden_actor = self.actor(states_seq)
-            # Detach hidden states
-            hidden_actor = tuple(h.detach() for h in hidden_actor)
-            # TD3 fix: actor should optimize Q(s_t, π(s_t)) using last timestep only
-            # actor_actions is already [B,1,1] from ActorLSTM fix
-            q_actor, _ = self.critic(states_seq, actor_actions)
-            # Use only last timestep Q-value
+            actor_actions_full, actor_hidden = self.actor(states_seq)
+            actor_hidden = tuple(h.detach() for h in actor_hidden)
+            if actor_actions_full.dim() == 2:
+                actor_actions_full = actor_actions_full.unsqueeze(1)
+            actor_last = actor_actions_full[:, -1:, :].view(batch_size, 1, -1)
+            actor_actions_seq = actor_last.expand(-1, seq_len_actual, -1)
+            q_actor, _ = self.critic(states_seq, actor_actions_seq)
             actor_loss = -q_actor.outputs[:, -1, :].mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
-
-            for param in self.critic.parameters():
-                param.requires_grad = True
 
             self._soft_update(self.actor_target, self.actor)
             self._soft_update(self.critic_target, self.critic)

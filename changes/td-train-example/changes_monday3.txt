@@ -1,0 +1,5 @@
+﻿Changes before td3_monday3 training:
+- Combined reward weights: peak base 35 â‚¬/MW + 110 â‚¬/MW variable; off-peak penalty 2.5 â‚¬/MW + 35 â‚¬/MWh; cheap-hour 6 + 24; PV 4 + 16; high-price penalty 12 + 45.
+- Peak post-norm bonus: base (0.3 AM / 0.4 PM / 0.2 others) + 0.3Ă—action_fraction, with -0.25 penalty if SOC>min+5% and no discharge.
+- End-of-day SOC penalty commented out.
+- Peak post-norm bonus: commented out
