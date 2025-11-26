@@ -320,12 +320,6 @@ class BESSEnv(gym.Env):
         self.evening_peak_hours = _build_peak_window(getattr(self, "k_even", -1), 12, 23)
         self.peak_hours = self.morning_peak_hours.union(self.evening_peak_hours)
         
-        # Pre-peak hours (1-2 hours before each peak) - computed once
-        k_morn = getattr(self, "k_morn", -1)
-        k_even = getattr(self, "k_even", -1)
-        self.pre_morning_hours = {max(0, k_morn - 2), max(0, k_morn - 1)} if k_morn > 0 else set()
-        self.pre_evening_hours = {max(12, k_even - 2), max(12, k_even - 1)} if k_even > 12 else set()
-        
         if len(self.day_data) != 24:
             print(f"Warning: Day {self.current_day} has {len(self.day_data)} hours instead of 24")
         
@@ -632,50 +626,29 @@ class BESSEnv(gym.Env):
             hours_to_peak = int(max(0, next_peak_hour - hour))
         peak_hours = getattr(self, "peak_hours", set())
 
-        # --- Reward Shaping: td3_tuesday4 version (price-driven arbitrage) ---
+        # --- Minimal reward shaping ---
+
         reward = 0.0
-
-        # 1) Core arbitrage: charge when cheap, discharge when expensive
-        if p_battery < 0:  # Charging
+        if p_battery < 0:
             reward += cheap_factor * energy_mwh * 20.0
-
-        if p_battery > 0:  # Discharging
+        if p_battery > 0:
             reward += expensive_factor * energy_mwh * 20.0
-
-            # Extra bonus for discharging during identified peak hours
+            # Extra bonus for discharging during peak hours
             if hour in peak_hours:
                 reward += energy_mwh * 30.0  # Strong peak discharge bonus
 
-        # 2) Pre-peak accumulation incentive (aim for high SOC before peak)
-        if hours_to_peak is not None and hours_to_peak in (1, 2):
-            soc_target = 0.85
-            soc_gap = max(0.0, soc_target - self.soc)
-            if soc_gap > 0.0:
-                if p_battery < 0:  # Charging toward target
-                    reward += soc_gap * energy_mwh * 10.0
-                elif p_battery > 0 and soc_gap > 0.1:  # Discharging when should hold
-                    reward -= 20.0 * energy_mwh
-
-        # 3) Cheap hour opportunity cost: penalize not charging enough when cheap
-        cheap_hours = getattr(self, "cheapest_hours", {0, 1, 2, 3})
-        if hour in cheap_hours and self.soc < 0.80 and p_battery >= 0:
-            # If we're in a cheap window, not charging toward a comfortable SOC is bad
-            reward -= (0.80 - self.soc) * 3.0
-
-        # 4) SOC boundary penalties (soft safety band 20%–80%)
         soc_low_bound = 0.20
         soc_high_bound = 0.80
         if self.soc < soc_low_bound:
             reward -= (soc_low_bound - self.soc) * 30.0
         if self.soc > soc_high_bound:
-            reward -= (self.soc - soc_high_bound) * 40.0
+            reward -= (self.soc - soc_high_bound) * 30.0
 
-        # 5) Terminal SOC target: end-of-day around 50%
         if (hour + 1) >= self.max_hours:
             target_soc = 0.50
-            reward -= 40.0 * abs(self.soc - target_soc)
+            reward += -40.0 * abs(self.soc - target_soc)
 
-        # 6) Linear scaling (td3_tuesday4): keep reward magnitudes moderate
+        # Normalize reward
         reward = reward / 25.0
 
         future_features = getattr(self, "_latest_obs_future_features", {}) or {}
@@ -936,4 +909,3 @@ class BESSEnv(gym.Env):
     def close(self):
         """Clean up resources."""
         pass
-
