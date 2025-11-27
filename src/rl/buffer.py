@@ -19,7 +19,14 @@ ArrayLike = np.ndarray
 
 
 class ReplayBuffer:
-    """Fixed-size replay buffer backed by pre-allocated numpy arrays.
+    """
+    Fixed-size replay buffer backed by pre-allocated numpy arrays.
+
+    In plain terms: this is a big circular list of past experiences
+    (state, action, reward, next_state, done). The agent stores every
+    step here and later samples random mini-batches for training. This
+    is standard practice in DDPG/TD3 and helps break temporal
+    correlations in the data.
 
     Args:
         state_dim: Dimensionality of the flattened observation vector.
@@ -78,8 +85,16 @@ class ReplayBuffer:
         next_state: ArrayLike,
         done: bool,
     ) -> None:
-        """Insert a transition into the buffer."""
+        """
+        Insert a transition into the buffer.
 
+        Args:
+            state:      observation before taking the action.
+            action:     action taken by the agent.
+            reward:     scalar reward received after the step.
+            next_state: observation after the environment step.
+            done:       True if the episode ended at this step.
+        """
         idx = self.position
         self.states[idx] = np.asarray(state, dtype=self.dtype)
         self.actions[idx] = np.asarray(action, dtype=self.dtype)
@@ -91,7 +106,8 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int, seq_len: int = 1) -> Dict[str, ArrayLike]:
-        """Sample a batch of transitions or contiguous sequences.
+        """
+        Sample a batch of transitions or contiguous sequences.
 
         Args:
             batch_size: Number of samples to draw.
@@ -111,6 +127,7 @@ class ReplayBuffer:
         """
 
         if self.size == 0:
+            # No data to train on yet
             raise ValueError("Cannot sample from an empty replay buffer")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -119,7 +136,9 @@ class ReplayBuffer:
         if seq_len > self.size:
             raise ValueError("seq_len cannot exceed the number of stored items")
 
+        # 1) choose buffer indices so that we do not cross episode boundaries
         indices = self._sample_indices(batch_size, seq_len)
+        # 2) gather contiguous sequences ending at each chosen index
         states = self._gather_sequences(self.states, indices, seq_len)
         actions = self._gather_sequences(self.actions, indices, seq_len)
         rewards = self._gather_sequences(self.rewards[:, None], indices, seq_len).squeeze(-1)
@@ -185,6 +204,13 @@ class ReplayBuffer:
     # ------------------------------------------------------------------
 
     def _sample_indices(self, batch_size: int, seq_len: int) -> np.ndarray:
+        """
+        Pick valid end-indices for sequences of length ``seq_len``.
+
+        We make sure that the chosen indices do not "jump over" episode
+        boundaries (where ``done`` is True), so each sampled sequence
+        belongs to a single episode.
+        """
         indices = np.empty(batch_size, dtype=np.int64)
         attempts = 0
         max_attempts = batch_size * 50
@@ -226,6 +252,11 @@ class ReplayBuffer:
         indices: Iterable[int],
         seq_len: int,
     ) -> ArrayLike:
+        """
+        Given a 1D buffer ``array`` and some end indices, build a tensor of
+        shape ``[batch_size, seq_len, ...]`` where each row is a contiguous
+        slice ending at the corresponding index.
+        """
         array = np.asarray(array)
         batch_size = len(indices)
         suffix = array.shape[1:]

@@ -32,14 +32,18 @@ def _build_mlp(input_dim: int, hidden_sizes: Sequence[int]) -> nn.Sequential:
 
 @dataclass
 class LSTMOutput:
-    """Container for outputs of LSTM-based networks."""
+    """
+    Small helper class to bundle what an LSTM block returns:
+      * outputs: the sequence of outputs for every time step.
+      * hidden:  hidden state tuple (h, c) that can be fed back in.
+    """
 
     outputs: Tensor
     hidden: Tuple[Tensor, Tensor]
 
 
 class ActorLSTM(nn.Module):
-    """LSTM-based actor that outputs continuous actions in ``[0, 1]``.
+    """LSTM-based actor that outputs continuous actions in ``[-1, 1]``.
 
     Args:
         state_dim: Number of input features per time step.
@@ -64,12 +68,14 @@ class ActorLSTM(nn.Module):
     ) -> None:
         super().__init__()
         self.state_dim = state_dim
+        # Recurrent part that looks at the sequence over time
         self.lstm = nn.LSTM(
             input_size=state_dim,
             hidden_size=lstm_hidden_size,
             num_layers=lstm_num_layers,
             batch_first=True,
         )
+        # Feed-forward layers applied to every time step of the LSTM output
         self.backbone = _build_mlp(lstm_hidden_size, mlp_hidden_sizes)
         self.head = nn.Linear(mlp_hidden_sizes[-1] if mlp_hidden_sizes else lstm_hidden_size, 1)
 
@@ -81,17 +87,23 @@ class ActorLSTM(nn.Module):
         if state_seq.dim() != 3:
             raise ValueError("state_seq must have shape [batch, time, features]")
 
+        # Run the whole sequence through the LSTM
         lstm_out, hidden_out = self.lstm(state_seq, hidden)
+        # Apply MLP to each time step
         features = self.backbone(lstm_out)
+        # Map to a single action value per time step, then squash to [-1, 1]
         raw_action = self.head(features)
-        # Output action in [-1, 1] range (tanh already provides this range)
-        # TD3 fix: return only last timestep action
         actions = torch.tanh(raw_action)  # shape [B,T,1], range [-1, 1]
         return actions, hidden_out
 
 
 class _CriticHead(nn.Module):
-    """Single critic head: LSTM backbone + MLP predicting scalar Q-values."""
+    """
+    Single critic head: LSTM backbone + MLP predicting scalar Q-values.
+
+    Given a sequence of (state, action) pairs it produces a sequence of Q-values.
+    In our TD3 setup we typically only use the **last** time step.
+    """
 
     def __init__(
         self,
@@ -101,6 +113,7 @@ class _CriticHead(nn.Module):
         mlp_hidden_sizes: Sequence[int] = (64, 64),
     ) -> None:
         super().__init__()
+        # Sequence encoder
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=lstm_hidden_size,
@@ -119,15 +132,22 @@ class _CriticHead(nn.Module):
         if x.dim() != 3:
             raise ValueError("Input must have shape [batch, time, features]")
 
+        # Encode the whole sequence, then push through the MLP
         lstm_out, hidden_out = self.lstm(x, hidden)
         features = self.backbone(lstm_out)
-        # TD3 fix: return only last timestep Q-value
+        # Return Q-value only for the last time step (shape [B,1,1])
         q_values = self.head(features[:, -1:, :])
         return LSTMOutput(outputs=q_values, hidden=hidden_out)
 
 
 class CriticLSTM(nn.Module):
-    """Twin-critic module returning Q-value sequences ``[batch, time, 1]``."""
+    """
+    Twin-critic module.
+
+    Wraps two independent `_CriticHead`s (q1 and q2) so TD3 can use
+    clipped double-Q: we take the minimum of the two critics to reduce
+    over-estimation bias.
+    """
 
     def __init__(
         self,
@@ -138,6 +158,7 @@ class CriticLSTM(nn.Module):
         mlp_hidden_sizes: Sequence[int] = (64, 64),
     ) -> None:
         super().__init__()
+        # Critic sees state and action together at each time step
         input_dim = state_dim + act_dim
         self.q1 = _CriticHead(
             input_dim=input_dim,

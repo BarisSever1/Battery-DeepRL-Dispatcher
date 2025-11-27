@@ -25,6 +25,12 @@ class BESSEnv(gym.Env):
     """
     Gymnasium environment for BESS + RES co-optimization.
     
+    High-level idea (for newcomers):
+      * We simulate one day (24 hours) of operation of a battery + solar plant.
+      * At each hour the agent chooses how hard to charge or discharge.
+      * The environment enforces all electrical and SOC constraints and
+        computes revenue + degradation costs + shaping bonuses/penalties.
+    
     State: 21-dimensional vector (normalized to [-1, 1])
         - Temporal: k, weekday, season
         - Prices: price_em, price_as
@@ -38,8 +44,7 @@ class BESSEnv(gym.Env):
         - δ > 0: Discharge (magnitude scales discharging power)
         - δ = 0: Idle
     
-    Reward: Total profit - degradation cost
-        = Revenue_RES + Revenue_Energy + Revenue_Reserve - Cost_Degradation
+    In other words, the agent "moves" energy in and out of the battery over the day.
     """
     
     metadata = {'render_modes': []}
@@ -237,15 +242,18 @@ class BESSEnv(gym.Env):
         options: Optional[Dict[str, Any]] = None
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
-        Reset the environment for a new episode (new day).
+        Reset the environment for a new episode (one full day).
+        
+        We pick a date from the dataset, reset all SOC / DOD / revenue
+        counters, and prepare the first observation.
         
         Args:
-            seed: Random seed
-            options: Additional options (e.g., specific date to use)
+            seed: Random seed for reproducibility.
+            options: Can include a fixed ``date`` to evaluate a specific day.
         
         Returns:
-            observation: Initial state vector (16 dims)
-            info: Additional information
+            observation: Initial normalized state vector.
+            info: Additional information (e.g. which day was chosen).
         """
         super().reset(seed=seed)
         
@@ -255,7 +263,7 @@ class BESSEnv(gym.Env):
         else:
             self.current_day = np.random.choice(self.dates)
         
-        # Get day's data
+        # Get all rows (hours) for the chosen day
         self.day_data = self.data[self.data['date'] == self.current_day].reset_index(drop=True)
         # Cache denormalized day-ahead prices for reward shaping or diagnostics
         try:
@@ -275,7 +283,8 @@ class BESSEnv(gym.Env):
             self.day_price_min_raw = float('nan')
             self.day_price_range_raw = float('nan')
 
-        # Compute peak discharge slots directly from today's price curve (fallback to dataset hours)
+        # Compute morning/evening price peaks directly from today's price curve.
+        # These are later used to build peak windows for reward shaping.
         try:
             prices = np.asarray(self._day_prices_raw, dtype=float)
             assert prices.shape[0] == 24
@@ -291,7 +300,7 @@ class BESSEnv(gym.Env):
                 self.k_morn = -1
                 self.k_even = -1
 
-        # Recompute cheapest hours for the selected day (for optional shaping/diagnostics)
+        # Recompute cheapest hours for the selected day (for shaping/diagnostics)
         try:
             if self._day_prices_raw is not None and len(self._day_prices_raw) >= 2:
                 prices_arr = np.asarray(self._day_prices_raw, dtype=float)
@@ -361,10 +370,11 @@ class BESSEnv(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Get current state observation (21-dimensional vector).
+        Build the current observation (21-dimensional normalized vector).
         
-        Returns:
-            Normalized state vector matching features.yaml order plus env-derived signals.
+        We take the raw feature row for the current hour, replace SOC / DOD
+        with the environment's internal values, and append a few extra
+        "planning" features (time to next peak, trend, etc.).
         """
         if self.current_hour >= len(self.day_data):
             # Episode done, return last valid state
@@ -505,12 +515,24 @@ class BESSEnv(gym.Env):
         action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
-        Execute one step with ONLY day-ahead energy market + reserve availability.
-        PV → grid revenue uses price_em (no PPA).
-        δ ∈ [-1, 1]: negative = charge, positive = discharge, 0 = idle.
-        Reserve is derived from remaining headroom (β=1).
+        Run one simulation step (one hour) with the chosen action.
+
+        High-level flow:
+          1. Interpret the action as a battery power command.
+          2. Enforce all physical/grid/SOC limits.
+          3. Route PV and battery power to grid / charging.
+          4. Update SOC and degradation.
+          5. Compute revenues + reward shaping.
+          6. Advance the hour and return the next observation and reward.
+
+        Conventions:
+          * ``action[0]`` in [-1, 1]:
+                < 0  → charge,
+                > 0  → discharge,
+                = 0  → idle.
+          * All power values are in MW, energies in MWh, prices in €/MWh.
         """
-        # === ACTION PARSING: RL-friendly constant scaling ===
+        # === ACTION PARSING: map policy output to physical power command ===
         # delta ∈ [-1,1] maps linearly to battery power [-Pmax, +Pmax]
         delta = float(np.clip(action[0], -1.0, 1.0))
         p_battery_cmd = delta * self.P_bess_max  # MW (unconstrained command)
@@ -526,7 +548,7 @@ class BESSEnv(gym.Env):
         dt = self.dt
         Emax = self.E_capacity
 
-        # === 2) APPLY PHYSICAL LIMITS ===
+        # === 2) APPLY PHYSICAL LIMITS (SOC, converter, etc.) ===
         # Max discharge available limited by SOC:
         pmax_dis = min(
             self.P_bess_max,
@@ -544,7 +566,7 @@ class BESSEnv(gym.Env):
         else:
             p_battery = max(p_battery_cmd, -pmax_ch)
 
-        # --- 3) AC-coupled routing with PV priority
+        # --- 3) AC-coupled routing with PV priority ---
         if p_battery >= 0.0:
             # Discharging: all PV goes to grid; battery exports to EM
             p_pv_grid = p_pv_t
@@ -559,7 +581,7 @@ class BESSEnv(gym.Env):
         # Request full capacity; constraints will reduce to feasible remainder
         p_reserve_req = self.P_bess_max
 
-        # --- 5) Apply constraints (pass PV-to-grid for POI check)
+        # --- 5) Apply POI / reserve constraints (may clip p_battery / p_reserve) ---
         p_battery_feas, p_reserve_feas = self._apply_constraints(
             p_battery=p_battery,
             p_reserve=p_reserve_req,
@@ -582,8 +604,7 @@ class BESSEnv(gym.Env):
 
         p_reserve = p_reserve_feas
 
-        # --- 6) Update SOC & DOD
-        # DOD fix: now uses self.soc_previous and self.soc; removed unused parameters.
+        # --- 6) Update SOC & DOD (battery state) ---
         self.soc_previous = self.soc
         self.soc = self._update_soc(p_battery)
         self._reset_dod_daily_if_needed(hour)
@@ -593,7 +614,7 @@ class BESSEnv(gym.Env):
         soc_low = self.soc_min + 0.05
         soc_high = self.soc_max - 0.05
 
-        # --- 7) Economics (NO PPA): all PV-to-grid at price_em
+        # --- 7) Economics (NO PPA): compute money flows for this hour ---
         revenue_pv_grid  = p_pv_grid * price_em * dt          # €/step
         revenue_energy   = p_bess_em * price_em * dt          # €/step (neg if buying)
         revenue_reserve  = p_reserve  * price_as * dt         # €/step
@@ -607,14 +628,14 @@ class BESSEnv(gym.Env):
         # )
         self.daily_throughput += abs(p_battery) * dt
         
-        # --- Price structure factors ---
+        # --- Price structure factors (how cheap/expensive is this hour?) ---
         price_min = getattr(self, "day_price_min_raw", price_em)
         price_max = getattr(self, "day_price_max_raw", price_em)
         price_range = max(1e-6, price_max - price_min)
         cheap_factor = float(np.clip((price_max - price_em) / price_range, 0.0, 1.0))
         expensive_factor = float(np.clip((price_em - price_min) / price_range, 0.0, 1.0))
 
-        # --- Upcoming peak hour ---
+        # --- Upcoming peak hour (used for pre-peak shaping) ---
         next_peak_hour = None
         if hasattr(self, "peak_hours"):
             for h in sorted(self.peak_hours):
@@ -647,8 +668,7 @@ class BESSEnv(gym.Env):
         if (hour + 1) >= self.max_hours:
             target_soc = 0.50
             reward += -40.0 * abs(self.soc - target_soc)
-
-        # Normalize reward
+        
         reward = reward / 25.0
 
         future_features = getattr(self, "_latest_obs_future_features", {}) or {}
