@@ -569,6 +569,8 @@ class BESSEnv(gym.Env):
         revenue_reserve  = p_reserve  * price_as * dt         # €/step
         cost_degradation = self._calculate_degradation_cost(p_battery)
         
+        # === RAW ECONOMIC REWARD (PRIMARY) ===
+        # Base reward is pure economics: revenue - costs
         raw_reward = (
              revenue_pv_grid
              + revenue_energy
@@ -577,14 +579,14 @@ class BESSEnv(gym.Env):
         )
         self.daily_throughput += abs(p_battery) * dt
         
-        # --- Price structure factors (how cheap/expensive is this hour?) ---
+        # --- Price structure factors (for minimal economics-aligned shaping) ---
         price_min = getattr(self, "day_price_min_raw", price_em)
         price_max = getattr(self, "day_price_max_raw", price_em)
         price_range = max(1e-6, price_max - price_min)
         cheap_factor = float(np.clip((price_max - price_em) / price_range, 0.0, 1.0))
         expensive_factor = float(np.clip((price_em - price_min) / price_range, 0.0, 1.0))
 
-        # --- Upcoming peak hour (used for pre-peak shaping) ---
+        # --- Upcoming peak hour (for arbitrage opportunity estimation) ---
         next_peak_hour = None
         if hasattr(self, "peak_hours"):
             for h in sorted(self.peak_hours):
@@ -595,103 +597,97 @@ class BESSEnv(gym.Env):
         if next_peak_hour is not None:
             hours_to_peak = int(max(0, next_peak_hour - hour))
         peak_hours = getattr(self, "peak_hours", set())
-
-        # === OPTIMIZED REWARD SHAPING ===
-        # Designed to break local optimum and avoid underestimation bias
-        # Target: Q-values in range 5-15 for good actions, strong penalties for bad actions
-        reward = 0.0
-        
-        # Get next upcoming peak hour for timing checks
-        # This handles both morning and evening peaks correctly
-        next_peak_hour = None
-        if self.peak_hours:
-            for h in sorted(self.peak_hours):
-                if h >= hour:
-                    next_peak_hour = h
-                    break
-        # If no peak hour found, we're past all peaks (use 24 as sentinel)
         has_upcoming_peak = next_peak_hour is not None
+
+        # === CALCULATE NORMALIZATION FACTOR (FIXED FOR STABILITY) ===
+        # Raw economics can range from -3000 to +3000 (e.g., 20 MW × 150 €/MWh)
+        # Use FIXED normalization to ensure reward consistency across episodes
+        # Adaptive normalization causes instability: different days have different price ranges,
+        # making rewards incomparable and causing Q-values to diverge
         
-        # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
-        # This is the main profit opportunity - reward it very strongly
-        if p_battery > 1e-3:  # Discharging
-            if hour in self.peak_hours:
-                # Strong base reward + energy-scaled bonus
-                base_peak_reward = 15.0  # Base reward for attempting peak discharge
-                energy_bonus = expensive_factor * energy_mwh * 20.0  # Up to +20 per MWh
-                reward += base_peak_reward + energy_bonus
-            else:
-                # Discharging outside peak = missed opportunity
-                reward += -5.0  # Strong penalty for misaligned discharge
+        # Fixed normalization based on typical max reward:
+        # - Max discharge: 20 MW × 150 €/MWh × 1 hour = 3000 €
+        # - Max reserve: 20 MW × 50 €/MW·h × 1 hour = 1000 €  
+        # - Max PV: 20 MW × 150 €/MWh × 1 hour = 3000 €
+        # - Total max: ~4000 € per hour
+        # - Normalize to range -10 to +10: factor = 4000 / 10 = 400
+        normalization_factor = 400.0  # Fixed: ensures consistent reward scale across all episodes
         
-        # === 2) CHEAP HOUR CHARGING (WITH SOC HEADROOM CONSTRAINT) ===
-        elif p_battery < -1e-3:  # Charging
-            if hour in self.cheapest_hours:
-                # Reward charging during cheap hours, but penalize if too close to max SOC
-                # This prevents the local optimum of charging to max too early
-                soc_headroom = self.soc_max - self.soc
+        # This makes rewards comparable across different days/price levels
+        # and prevents the Q-value collapse we're seeing
+        
+        # === MINIMAL ECONOMICS-ALIGNED SHAPING (in normalized space) ===
+        # Shaping bonuses are calculated directly in normalized reward space
+        # This ensures they're proportional to the economic reward scale
+        shaping_bonus_normalized = 0.0
+        
+        # Estimate future peak price for arbitrage opportunity calculation
+        if has_upcoming_peak and next_peak_hour < len(self.day_data):
+            # Get raw price from future hour (denormalize from day_data)
+            future_price_norm = float(self.day_data.iloc[next_peak_hour]['price_em'])
+            future_price = self._denormalize('price_em', future_price_norm)
+            price_spread = future_price - price_em  # Expected profit per MWh from arbitrage
+        else:
+            future_price = price_em
+            price_spread = 0.0
+        
+        # === 1) CHARGE BONUS: Economics-aligned arbitrage opportunity ===
+        # Reward charging when there's a clear economic opportunity (cheap now, expensive later)
+        # Need to overcome negative raw reward from buying energy, so bonus must be substantial
+        if p_battery < -1e-3:  # Charging
+            soc_headroom = max(0.0, self.soc_max - self.soc)
+            if soc_headroom > 0.05:  # Only if there's room to charge
+                # Base bonus for charging during cheap hours (encourages exploration)
+                # This helps agent learn that charging can be profitable
+                if hour in self.cheapest_hours:
+                    # Base normalized bonus: 0.5-1.5 depending on how cheap
+                    base_charge_bonus = cheap_factor * 1.0  # Up to 1.0 normalized bonus
+                    base_charge_bonus *= min(1.0, soc_headroom / 0.2)  # Reduce if low headroom
+                    shaping_bonus_normalized += base_charge_bonus
                 
-                if has_upcoming_peak:
-                    # Before upcoming peak hours: reward charging but penalize approaching max SOC
-                    # This prevents charging to max before morning OR evening peak
-                    if soc_headroom > 0.15:  # Good headroom (>15% remaining)
-                        base_charge_reward = 8.0
-                        energy_bonus = cheap_factor * energy_mwh * 15.0
-                        reward += base_charge_reward + energy_bonus
-                    elif soc_headroom > 0.05:  # Moderate headroom (5-15%)
-                        # Diminishing returns - still reward but less
-                        base_charge_reward = 4.0
-                        energy_bonus = cheap_factor * energy_mwh * 10.0
-                        reward += base_charge_reward + energy_bonus
-                    else:  # Too close to max SOC (<5% headroom)
-                        # Strong penalty for charging when already near max
-                        reward += -10.0  # Penalty for charging to max too early
-                else:
-                    # After all peak hours: charging is less valuable (end of day)
-                    base_charge_reward = 5.0
-                    energy_bonus = cheap_factor * energy_mwh * 10.0
-                    reward += base_charge_reward + energy_bonus
-            else:
-                # Charging outside cheap hours = suboptimal
-                reward += -3.0  # Penalty for misaligned charge
+                # Additional arbitrage bonus if there's a clear future profit opportunity
+                if price_spread > 10.0:  # At least 10 €/MWh spread (meaningful arbitrage)
+                    # Calculate expected arbitrage profit in raw terms, then normalize
+                    # Expected profit = price_spread × energy_mwh (future revenue - current cost)
+                    expected_arbitrage_profit = price_spread * energy_mwh
+                    # Normalize the expected profit
+                    normalized_expected_profit = expected_arbitrage_profit / normalization_factor
+                    # Give a substantial bonus (15-25% of expected profit) to strongly encourage charging
+                    # This needs to be large enough to overcome negative raw reward
+                    arbitrage_bonus = normalized_expected_profit * 0.20  # 20% of normalized expected profit
+                    arbitrage_bonus *= cheap_factor  # More bonus when price is very cheap
+                    arbitrage_bonus *= min(1.0, soc_headroom / 0.2)  # Reduce if low headroom
+                    shaping_bonus_normalized += arbitrage_bonus
         
-        # === 3) IDLING REWARDS/PENALTIES ===
-        else:  # Idling (p_battery ≈ 0)
-            if hour in self.peak_hours:
-                # Idling during peak = missed major opportunity
-                if self.soc > self.soc_max - 0.05:
-                    # Full SOC at peak = worst case
-                    reward += -25.0  # Very strong penalty
-                else:
-                    # Can discharge but choosing not to
-                    reward += -8.0  # Strong penalty for idling at peak
-            elif hour in self.cheapest_hours:
-                # Idling during cheap hours = missed charging opportunity
-                reward += -4.0  # Moderate penalty
-            else:
-                # Idling during normal hours = acceptable strategy
-                # Preserves battery state, avoids unnecessary degradation
-                reward += 5.0  # Small reward for smart idling
+        # === 2) DISCHARGE REINFORCEMENT: Small signal for peak discharge ===
+        # Discharging during peak is already profitable (positive revenue_energy in raw_reward)
+        # Add a very small normalized bonus (0.1-0.5) to reinforce this behavior
+        if p_battery > 1e-3:  # Discharging
+            if hour in peak_hours:
+                # Small normalized bonus proportional to energy discharged
+                # Max discharge (20 MW × 1 hour) normalized = ~10, so bonus should be ~0.1-0.3
+                normalized_energy = energy_mwh / (self.P_bess_max * dt)  # Fraction of max capacity
+                discharge_bonus = expensive_factor * normalized_energy * 0.2  # 0.2 max bonus
+                shaping_bonus_normalized += discharge_bonus
         
-        # === 4) ADDITIONAL CONSTRAINTS ===
-        # Penalize reaching max SOC before upcoming peak hours (critical for breaking local optimum)
-        # This applies before BOTH morning and evening peaks
-        if has_upcoming_peak and self.soc >= self.soc_max - 0.05:
-            # Reached max SOC too early - can't discharge at upcoming peak
-            reward += -20.0  # Very strong penalty
+        # === 3) SOC CONSTRAINT PENALTIES (prevent infeasible states) ===
+        # These are operational constraints, not economic shaping
+        # Penalties in normalized space: -0.5 to -2.0 (small relative to economic rewards)
+        if self.soc >= self.soc_max - 0.01:  # At max SOC
+            if p_battery < -1e-3:  # Trying to charge when full
+                shaping_bonus_normalized -= 1.0  # Small normalized penalty
         
-        # Reward maintaining good SOC headroom before upcoming peak hours
-        if has_upcoming_peak and 0.3 < self.soc < 0.7:
-            # Sweet spot: have energy stored but room for more
-            reward += 3.0  # Bonus for maintaining good headroom
+        if self.soc <= self.soc_min + 0.01:  # At min SOC
+            if p_battery > 1e-3:  # Trying to discharge when empty
+                shaping_bonus_normalized -= 1.0  # Small normalized penalty
         
-        # Penalize being at min SOC during peak hours (can't discharge)
-        if hour in self.peak_hours and self.soc <= self.soc_min + 0.05:
-            reward += -15.0  # Strong penalty for empty battery at peak
-
-
-        # Clip for stability (large range to accommodate strong signals)
-        reward = float(np.clip(reward, -50.0, 50.0))
+        # === FINAL REWARD: Normalized economics + normalized shaping ===
+        normalized_raw_reward = raw_reward / normalization_factor
+        reward = normalized_raw_reward + shaping_bonus_normalized
+        
+        # Clip for stability (normalized rewards should be in reasonable range)
+        # With adaptive normalization, rewards typically stay in -15 to +15 range
+        reward = float(np.clip(reward, -20.0, 20.0))
 
 
     
