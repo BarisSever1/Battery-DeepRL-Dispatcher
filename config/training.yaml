@@ -2,7 +2,7 @@
 
 algorithm:
   name: TD3
-  gamma: 1            # slightly sub-1 for smoother temporal credit
+  gamma: 0.995        # discount factor (0.99 for stability, avoids exploding Q-values)
   tau: 0.005              # Polyak (slower target updates for stability)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)

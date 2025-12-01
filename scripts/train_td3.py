@@ -391,7 +391,15 @@ def main() -> None:
         critic_scheduler = StepLR(agent.critic_optimizer, step_size=decay_epochs, gamma=decay_factor)
         print(f"LR schedule enabled: StepLR every {decay_epochs} epochs, factor={decay_factor}")
 
-    buffer = ReplayBuffer(state_dim=state_dim, action_dim=action_dim, capacity=args.buffer_size)
+    # Create buffer with matching n_step and gamma from TD3 config
+    # This ensures n-step returns (if used) are computed with the correct discount factor
+    buffer = ReplayBuffer(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        capacity=args.buffer_size,
+        n_step=config.n_step,  # Match TD3 config
+        gamma=config.gamma,  # Match TD3 config
+    )
 
     total_episodes = args.epochs * args.days_per_epoch
 

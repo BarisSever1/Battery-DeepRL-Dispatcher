@@ -24,7 +24,7 @@ class TD3Config:
     from a config file (YAML) when constructing the agent.
     """
 
-    gamma: float = 1
+    gamma: float = 0.995
     n_step: int = 1
     use_n_step: bool = True
     tau: float = 0.01
@@ -221,18 +221,30 @@ class TD3Agent:
             if next_actions_full.dim() == 2:
                 next_actions_full = next_actions_full.unsqueeze(1)
 
-            # TD3 target-policy smoothing: add noise only to the **last** action
+            # TD3 target-policy smoothing: add noise to actions in the sequence
+            # Primary smoothing on the last action (standard TD3), with smaller noise
+            # on earlier steps to improve exploration across the action history.
+            next_actions_seq = next_actions_full.clone()
+            
+            # Add noise to the last action (primary smoothing, standard TD3)
             next_actions_last = next_actions_full[:, -1:, :]
             target_noise = torch.randn_like(next_actions_last) * self.config.target_std
             target_noise = target_noise.clamp(-self.config.noise_clip, self.config.noise_clip)
             noisy_last = (next_actions_last + target_noise).clamp(
                 self.config.action_low, self.config.action_high
             )
-
-            # Use the original target action sequence for history, but replace
-            # the final time step with the smoothed/clamped version.
-            next_actions_seq = next_actions_full.clone()
             next_actions_seq[:, -1:, :] = noisy_last
+            
+            # Add smaller noise to earlier steps for better exploration (optional improvement)
+            if next_actions_seq.shape[1] > 1:
+                # Use 30% of target_std for earlier steps to maintain exploration without
+                # destabilizing the target policy too much
+                early_noise_std = self.config.target_std * 0.3
+                early_noise = torch.randn_like(next_actions_seq[:, :-1, :]) * early_noise_std
+                early_noise = early_noise.clamp(-self.config.noise_clip * 0.3, self.config.noise_clip * 0.3)
+                next_actions_seq[:, :-1, :] = (
+                    next_actions_seq[:, :-1, :] + early_noise
+                ).clamp(self.config.action_low, self.config.action_high)
 
             q1_next, q2_next = self.critic_target(target_state_seq, next_actions_seq)
             q1_next_hidden = tuple(h.detach() for h in q1_next.hidden)
@@ -262,16 +274,16 @@ class TD3Agent:
             actor_hidden = tuple(h.detach() for h in actor_hidden)
             if actor_actions_full.dim() == 2:
                 actor_actions_full = actor_actions_full.unsqueeze(1)
-            # For the actor loss, we only need the final action in the sequence.
-            actor_last = actor_actions_full[:, -1:, :].view(batch_size, 1, -1)
-            # Critic sees the state history and the full implied policy sequence,
-            # but because it only outputs the last Q, effectively this is
-            # Q(s_{1:T}, π(s_{1:T})). We construct a sequence that is zero
-            # everywhere except the last step where we plug in actor_last.
-            actor_actions_seq = torch.zeros_like(actions_seq)
-            actor_actions_seq[:, -1:, :] = actor_last
-            q_actor, _ = self.critic(states_seq, actor_actions_seq)
-            actor_loss = -q_actor.outputs[:, -1, :].mean()
+            # FIXED: Use the full policy-generated action sequence instead of zero-padding.
+            # This ensures the critic sees realistic action histories that match what
+            # the policy actually generates, avoiding the mismatch between training
+            # (zero-padded) and inference (full policy sequence).
+            actor_actions_seq = actor_actions_full
+            q1_actor, q2_actor = self.critic(states_seq, actor_actions_seq)
+            # Use min(Q1, Q2) for actor update (TD3 standard: clipped double-Q for actor)
+            # This prevents overestimation bias and makes the actor more conservative
+            q_actor_min = torch.min(q1_actor.outputs[:, -1, :], q2_actor.outputs[:, -1, :])
+            actor_loss = -q_actor_min.mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()

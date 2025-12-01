@@ -596,31 +596,103 @@ class BESSEnv(gym.Env):
             hours_to_peak = int(max(0, next_peak_hour - hour))
         peak_hours = getattr(self, "peak_hours", set())
 
-        # --- Minimal reward shaping ---
-        # Symmetric bonuses: charge during cheap hours, discharge during peak hours
+        # === OPTIMIZED REWARD SHAPING ===
+        # Designed to break local optimum and avoid underestimation bias
+        # Target: Q-values in range 5-15 for good actions, strong penalties for bad actions
         reward = 0.0
-
-        # Penalize actions that move SOC without economic gain
-        idle_penalty = -0.1
-        charge_penalty = -0.2
-        discharge_penalty = -0.2
-
-        # Bonuses for doing the right thing at the right time
-        if p_battery < -1e-3:  # Charging
-            if hour in self.cheapest_hours:
-                reward += cheap_factor * energy_mwh * 20.0
-            else:
-                reward += charge_penalty  # discourage unnecessary charging
-        elif p_battery > 1e-3:  # Discharging
+        
+        # Get next upcoming peak hour for timing checks
+        # This handles both morning and evening peaks correctly
+        next_peak_hour = None
+        if self.peak_hours:
+            for h in sorted(self.peak_hours):
+                if h >= hour:
+                    next_peak_hour = h
+                    break
+        # If no peak hour found, we're past all peaks (use 24 as sentinel)
+        has_upcoming_peak = next_peak_hour is not None
+        
+        # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
+        # This is the main profit opportunity - reward it very strongly
+        if p_battery > 1e-3:  # Discharging
             if hour in self.peak_hours:
-                reward += expensive_factor * energy_mwh * 20.0
+                # Strong base reward + energy-scaled bonus
+                base_peak_reward = 15.0  # Base reward for attempting peak discharge
+                energy_bonus = expensive_factor * energy_mwh * 20.0  # Up to +20 per MWh
+                reward += base_peak_reward + energy_bonus
             else:
-                reward += discharge_penalty  # discourage discharging outside peak
-        else:
-            reward += idle_penalty  # mild penalty to prevent too much idling
+                # Discharging outside peak = missed opportunity
+                reward += -5.0  # Strong penalty for misaligned discharge
+        
+        # === 2) CHEAP HOUR CHARGING (WITH SOC HEADROOM CONSTRAINT) ===
+        elif p_battery < -1e-3:  # Charging
+            if hour in self.cheapest_hours:
+                # Reward charging during cheap hours, but penalize if too close to max SOC
+                # This prevents the local optimum of charging to max too early
+                soc_headroom = self.soc_max - self.soc
+                
+                if has_upcoming_peak:
+                    # Before upcoming peak hours: reward charging but penalize approaching max SOC
+                    # This prevents charging to max before morning OR evening peak
+                    if soc_headroom > 0.15:  # Good headroom (>15% remaining)
+                        base_charge_reward = 8.0
+                        energy_bonus = cheap_factor * energy_mwh * 15.0
+                        reward += base_charge_reward + energy_bonus
+                    elif soc_headroom > 0.05:  # Moderate headroom (5-15%)
+                        # Diminishing returns - still reward but less
+                        base_charge_reward = 4.0
+                        energy_bonus = cheap_factor * energy_mwh * 10.0
+                        reward += base_charge_reward + energy_bonus
+                    else:  # Too close to max SOC (<5% headroom)
+                        # Strong penalty for charging when already near max
+                        reward += -10.0  # Penalty for charging to max too early
+                else:
+                    # After all peak hours: charging is less valuable (end of day)
+                    base_charge_reward = 5.0
+                    energy_bonus = cheap_factor * energy_mwh * 10.0
+                    reward += base_charge_reward + energy_bonus
+            else:
+                # Charging outside cheap hours = suboptimal
+                reward += -3.0  # Penalty for misaligned charge
+        
+        # === 3) IDLING REWARDS/PENALTIES ===
+        else:  # Idling (p_battery ≈ 0)
+            if hour in self.peak_hours:
+                # Idling during peak = missed major opportunity
+                if self.soc > self.soc_max - 0.05:
+                    # Full SOC at peak = worst case
+                    reward += -25.0  # Very strong penalty
+                else:
+                    # Can discharge but choosing not to
+                    reward += -8.0  # Strong penalty for idling at peak
+            elif hour in self.cheapest_hours:
+                # Idling during cheap hours = missed charging opportunity
+                reward += -4.0  # Moderate penalty
+            else:
+                # Idling during normal hours = acceptable strategy
+                # Preserves battery state, avoids unnecessary degradation
+                reward += 5.0  # Small reward for smart idling
+        
+        # === 4) ADDITIONAL CONSTRAINTS ===
+        # Penalize reaching max SOC before upcoming peak hours (critical for breaking local optimum)
+        # This applies before BOTH morning and evening peaks
+        if has_upcoming_peak and self.soc >= self.soc_max - 0.05:
+            # Reached max SOC too early - can't discharge at upcoming peak
+            reward += -20.0  # Very strong penalty
+        
+        # Reward maintaining good SOC headroom before upcoming peak hours
+        if has_upcoming_peak and 0.3 < self.soc < 0.7:
+            # Sweet spot: have energy stored but room for more
+            reward += 3.0  # Bonus for maintaining good headroom
+        
+        # Penalize being at min SOC during peak hours (can't discharge)
+        if hour in self.peak_hours and self.soc <= self.soc_min + 0.05:
+            reward += -15.0  # Strong penalty for empty battery at peak
 
-        # Optional: scale final reward for stability
-        reward /= 10.0
+
+        # Clip for stability (large range to accommodate strong signals)
+        reward = float(np.clip(reward, -50.0, 50.0))
+
 
     
         future_features = getattr(self, "_latest_obs_future_features", {}) or {}
