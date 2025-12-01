@@ -187,36 +187,30 @@ class TD3Agent:
                 return t.view(t.size(0), 1)
             raise ValueError("Unexpected tensor rank")
 
-        # By default we use the 1‑step reward/terminal flag from the last step
-        rewards_last = _last_step(rewards_raw)
-        dones_last = _last_step(dones_raw)
-
-        # Optionally replace 1‑step targets with n‑step ones from the buffer
-        use_n_step = self.config.use_n_step and "n_step_rewards" in batch
-        gamma_factor = self.config.gamma
-        target_state_seq = next_states_seq
-
-        if use_n_step:
-            n_rewards_raw = torch.as_tensor(batch["n_step_rewards"], dtype=torch.float32, device=self.device)
-            n_dones_raw = torch.as_tensor(batch["n_step_dones"], dtype=torch.float32, device=self.device)
-            n_next_states_raw = torch.as_tensor(batch["n_step_next_states"], dtype=torch.float32, device=self.device)
-            rewards_last = _last_step(n_rewards_raw)
-            dones_last = _last_step(n_dones_raw)
-            target_state_seq = n_next_states_raw
-            gamma_factor = self.config.gamma ** self.config.n_step
-
         batch_size = states_seq.size(0)
+        seq_len_actual = states_seq.shape[1]
 
-        # For the current Q estimate we now use the **full** action sequence
-        # as stored in the replay buffer: critic(states_seq, actions_seq).
-        # The critic still returns only the Q-value for the last time step,
-        # so this represents Q(s_{1:T}, a_{1:T}) evaluated at T.
+        # Extract rewards and dones for all time steps
+        # rewards_raw shape: [B, T] or [B, T, 1]
+        if rewards_raw.dim() == 3:
+            rewards_all = rewards_raw.squeeze(-1)  # [B, T]
+        else:
+            rewards_all = rewards_raw  # [B, T]
+        
+        if dones_raw.dim() == 3:
+            dones_all = dones_raw.squeeze(-1)  # [B, T]
+        else:
+            dones_all = dones_raw  # [B, T]
+
+        # For sequence returns: we learn Q-values for ALL time steps in the sequence
+        # This better utilizes the temporal structure for battery dispatch problems
         actions_for_critic = actions_seq
 
-        # ---- 2) Compute target Q values (no gradients) ----
+        # ---- 2) Compute target Q values for ALL time steps (no gradients) ----
         with torch.no_grad():
-            # Let the target actor produce a full next-action sequence
-            next_actions_full, hidden_next = self.actor_target(target_state_seq)
+            # Get next actions for all next states in the sequence
+            # next_states_seq[:, t, :] is the next state after states_seq[:, t, :]
+            next_actions_full, hidden_next = self.actor_target(next_states_seq)
             hidden_next = tuple(h.detach() for h in hidden_next)
             if next_actions_full.dim() == 2:
                 next_actions_full = next_actions_full.unsqueeze(1)
@@ -246,20 +240,30 @@ class TD3Agent:
                     next_actions_seq[:, :-1, :] + early_noise
                 ).clamp(self.config.action_low, self.config.action_high)
 
-            q1_next, q2_next = self.critic_target(target_state_seq, next_actions_seq)
+            # Compute Q-values for next states (all time steps)
+            q1_next, q2_next = self.critic_target(next_states_seq, next_actions_seq)
             q1_next_hidden = tuple(h.detach() for h in q1_next.hidden)
             q2_next_hidden = tuple(h.detach() for h in q2_next.hidden)
-            # Clipped double‑Q: take the smaller of the two target critics
-            min_q_next = torch.min(q1_next.outputs[:, -1, :], q2_next.outputs[:, -1, :]).view(batch_size, 1)
-            # Standard Bellman target: r + γ * (1‑done) * min_q_next
-            target_q = rewards_last + (1.0 - dones_last) * gamma_factor * min_q_next
-            target_q = target_q.view(batch_size, 1)
+            # Clipped double‑Q: take the smaller of the two target critics for all time steps
+            min_q_next = torch.min(q1_next.outputs, q2_next.outputs)  # [B, T, 1]
+            
+            # Compute target Q for ALL time steps: r_t + γ * (1-done_t) * Q(s_{t+1}, a_{t+1})
+            # For each time step t: target_q[t] = r[t] + γ * (1 - done[t]) * min_q_next[t]
+            # rewards_all: [B, T], min_q_next: [B, T, 1]
+            rewards_expanded = rewards_all.unsqueeze(-1)  # [B, T, 1]
+            dones_expanded = dones_all.unsqueeze(-1)  # [B, T, 1]
+            target_q_all = rewards_expanded + (1.0 - dones_expanded) * self.config.gamma * min_q_next  # [B, T, 1]
 
-        # ---- 3) Critic update: fit Q(s_{1:T}, a_{1:T}) to target_q ----
+        # ---- 3) Critic update: fit Q(s_{1:T}, a_{1:T}) to target_q for ALL time steps ----
         q1_current, q2_current = self.critic(states_seq, actions_for_critic)
-        q1_last = q1_current.outputs[:, -1, :].view(batch_size, 1)
-        q2_last = q2_current.outputs[:, -1, :].view(batch_size, 1)
-        critic_loss = nn.functional.mse_loss(q1_last, target_q) + nn.functional.mse_loss(q2_last, target_q)
+        # q1_current.outputs and q2_current.outputs have shape [B, T, 1]
+        
+        # Compute loss over ALL time steps in the sequence (not just the last one)
+        # This better utilizes the temporal structure and learns from all rewards in the sequence
+        q1_all = q1_current.outputs  # [B, T, 1]
+        q2_all = q2_current.outputs  # [B, T, 1]
+        
+        critic_loss = nn.functional.mse_loss(q1_all, target_q_all) + nn.functional.mse_loss(q2_all, target_q_all)
 
         # Backprop through both critics
         self.critic_optimizer.zero_grad()
@@ -270,20 +274,19 @@ class TD3Agent:
         actor_loss = torch.zeros(1, device=self.device)
         if self.total_it % self.config.policy_delay == 0:
             # ---- 4) Actor update: improve policy a = π(s_{1:T}) ----
+            # For sequence returns: maximize Q-values for ALL time steps in the sequence
             actor_actions_full, actor_hidden = self.actor(states_seq)
             actor_hidden = tuple(h.detach() for h in actor_hidden)
             if actor_actions_full.dim() == 2:
                 actor_actions_full = actor_actions_full.unsqueeze(1)
-            # FIXED: Use the full policy-generated action sequence instead of zero-padding.
-            # This ensures the critic sees realistic action histories that match what
-            # the policy actually generates, avoiding the mismatch between training
-            # (zero-padded) and inference (full policy sequence).
+            # Use the full policy-generated action sequence
             actor_actions_seq = actor_actions_full
             q1_actor, q2_actor = self.critic(states_seq, actor_actions_seq)
             # Use min(Q1, Q2) for actor update (TD3 standard: clipped double-Q for actor)
             # This prevents overestimation bias and makes the actor more conservative
-            q_actor_min = torch.min(q1_actor.outputs[:, -1, :], q2_actor.outputs[:, -1, :])
-            actor_loss = -q_actor_min.mean()
+            # For sequence returns: maximize Q-values across ALL time steps
+            q_actor_min = torch.min(q1_actor.outputs, q2_actor.outputs)  # [B, T, 1]
+            actor_loss = -q_actor_min.mean()  # Average over all time steps and batch
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
