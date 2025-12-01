@@ -297,11 +297,20 @@ class TD3Agent:
             self._soft_update(self.actor_target, self.actor)
             self._soft_update(self.critic_target, self.critic)
 
+        # Log Q-values at the FIRST time step of each sequence (closest to episode returns)
+        # Also log the mean over all time steps for comparison
+        q1_first_step = q1_current.outputs[:, 0, :].mean().item()  # [B, 1] -> scalar
+        q2_first_step = q2_current.outputs[:, 0, :].mean().item()  # [B, 1] -> scalar
+        q1_mean_all = q1_current.outputs.mean().item()  # Average over all [B, T, 1]
+        q2_mean_all = q2_current.outputs.mean().item()  # Average over all [B, T, 1]
+        
         return {
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
-            "q1_mean": q1_current.outputs.mean().item(),
-            "q2_mean": q2_current.outputs.mean().item(),
+            "q1_mean": q1_first_step,  # Q-value at first time step (should match episode returns)
+            "q2_mean": q2_first_step,  # Q-value at first time step (should match episode returns)
+            "q1_mean_all": q1_mean_all,  # Average over all time steps (for comparison)
+            "q2_mean_all": q2_mean_all,  # Average over all time steps (for comparison)
         }
 
     # ------------------------------------------------------------------
