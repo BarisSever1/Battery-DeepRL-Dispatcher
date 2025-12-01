@@ -24,8 +24,8 @@ class TD3Config:
     from a config file (YAML) when constructing the agent.
     """
 
-    gamma: float = 0.99
-    n_step: int = 6
+    gamma: float = 1
+    n_step: int = 1
     use_n_step: bool = True
     tau: float = 0.01
     policy_delay: int = 2
@@ -136,9 +136,9 @@ class TD3Agent:
             actions_last = action_seq[:, -1:, :]  # [B,1,A]
 
             if not eval_mode:
-                # Add Gaussian exploration noise during training
+                # Add Gaussian exploration noise during training (unclipped for better exploration)
                 noise = torch.randn_like(actions_last) * float(self.config.exploration_std)
-                noise = noise.clamp(-self.config.noise_clip, self.config.noise_clip)
+                # Noise clipping removed to allow sign flips (e.g., -0.9 + noise can become positive)
                 actions_last = actions_last + noise
 
             # Clamp action to the legal range

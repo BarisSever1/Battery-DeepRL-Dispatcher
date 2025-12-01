@@ -31,13 +31,12 @@ class BESSEnv(gym.Env):
       * The environment enforces all electrical and SOC constraints and
         computes revenue + degradation costs + shaping bonuses/penalties.
     
-    State: 21-dimensional vector (normalized to [-1, 1])
+    State: 18-dimensional vector (normalized to [-1, 1])
         - Temporal: k, weekday, season
         - Prices: price_em, price_as
         - Operations: p_res_total, soc, dod
         - Daily context: morning/evening max prices, argmax, min price, argmin, reserve min/max
-        - Planning aids: time_to_peak_hour, 6h price trend, delta to next morning/evening peaks,
-          prior-step SOC (to expose delta SOC directly)
+        - Planning aids: time_to_peak_hour, prior-step SOC (to expose delta SOC directly)
     
     Action: Continuous value δ ∈ [-1, 1]
         - δ < 0: Charge (magnitude scales charging power)
@@ -97,11 +96,11 @@ class BESSEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Observation: 21-dimensional state vector (normalized)
+        # Observation: 18-dimensional state vector (normalized)
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(21,),
+            shape=(18,),
             dtype=np.float32
         )
         
@@ -370,7 +369,7 @@ class BESSEnv(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Build the current observation (21-dimensional normalized vector).
+        Build the current observation (18-dimensional normalized vector).
         
         We take the raw feature row for the current hour, replace SOC / DOD
         with the environment's internal values, and append a few extra
@@ -414,50 +413,6 @@ class BESSEnv(gym.Env):
         t2p_norm = 2.0 * ((time_to_next_peak_hour - t2p_min) / t2p_range) - 1.0
         t2p_norm = float(np.clip(t2p_norm, -1.0, 1.0))
 
-        # --- Future-aware price features ---
-        price_range_scale = max(1.0, getattr(self, "day_price_range_raw", 1.0))
-        trend_norm = 0.0
-        delta_morning_norm = 0.0
-        delta_evening_norm = 0.0
-        price_trend = 0.0
-        delta_morning = 0.0
-        delta_evening = 0.0
-        price_em_raw = None
-        try:
-            if self._day_prices_raw is not None and len(self._day_prices_raw) > self.current_hour:
-                price_em_raw = float(self._day_prices_raw[self.current_hour])
-            else:
-                price_em_raw = float(self._denormalize('price_em', hour_data['price_em']))
-        except Exception:
-            price_em_raw = 0.0
-
-        if price_em_raw is None:
-            price_em_raw = 0.0
-
-        try:
-            if self._day_prices_raw is not None:
-                future_window = self._day_prices_raw[self.current_hour + 1 : min(len(self._day_prices_raw), self.current_hour + 1 + 6)]
-                if len(future_window) > 0:
-                    future_avg = float(np.mean(future_window))
-                    price_trend = future_avg - price_em_raw
-                    trend_norm = float(np.clip(price_trend / price_range_scale, -1.0, 1.0))
-
-                if 0 <= getattr(self, "k_morn", -1) < len(self._day_prices_raw):
-                    if self.current_hour <= self.k_morn:
-                        delta_morning = float(self._day_prices_raw[self.k_morn] - price_em_raw)
-                        delta_morning_norm = float(np.clip(delta_morning / price_range_scale, -1.0, 1.0))
-                if 0 <= getattr(self, "k_even", -1) < len(self._day_prices_raw):
-                    if self.current_hour <= self.k_even:
-                        delta_evening = float(self._day_prices_raw[self.k_even] - price_em_raw)
-                        delta_evening_norm = float(np.clip(delta_evening / price_range_scale, -1.0, 1.0))
-        except Exception:
-            price_trend = 0.0
-            delta_morning = 0.0
-            delta_evening = 0.0
-            trend_norm = 0.0
-            delta_morning_norm = 0.0
-            delta_evening_norm = 0.0
-
         # Get normalized features from data (already normalized)
         obs = np.array([
             hour_data['k'],                    # 1. Hour of day
@@ -477,17 +432,11 @@ class BESSEnv(gym.Env):
             hour_data['price_as_min'],         # 15. Daily reserve min
             hour_data['price_as_max'],         # 16. Daily reserve max
             t2p_norm,                          # 17. Normalized time to next peak
-            trend_norm,                        # 18. Future price trend (6h avg ratio)
-            delta_morning_norm,                # 19. Remaining spread to morning peak
-            delta_evening_norm,                # 20. Remaining spread to evening peak
-            self._normalize_soc(self.soc_previous),  # 21. SOC before action (gives delta context)
+            self._normalize_soc(self.soc_previous),  # 18. SOC before action (gives delta context)
         ], dtype=np.float32)
 
         self._latest_obs_future_features = {
             "time_to_peak_hour_raw": float(time_to_next_peak_hour),
-            "future_price_trend_raw": float(price_trend),
-            "delta_to_morning_peak_raw": float(delta_morning),
-            "delta_to_evening_peak_raw": float(delta_evening),
         }
         
         return obs
@@ -620,12 +569,12 @@ class BESSEnv(gym.Env):
         revenue_reserve  = p_reserve  * price_as * dt         # €/step
         cost_degradation = self._calculate_degradation_cost(p_battery)
         
-        # raw_reward = (
-        #     revenue_pv_grid
-        #     + revenue_energy
-        #     + revenue_reserve
-        #     - cost_degradation
-        # )
+        raw_reward = (
+             revenue_pv_grid
+             + revenue_energy
+             + revenue_reserve
+             - cost_degradation
+        )
         self.daily_throughput += abs(p_battery) * dt
         
         # --- Price structure factors (how cheap/expensive is this hour?) ---
@@ -648,33 +597,33 @@ class BESSEnv(gym.Env):
         peak_hours = getattr(self, "peak_hours", set())
 
         # --- Minimal reward shaping ---
-
+        # Symmetric bonuses: charge during cheap hours, discharge during peak hours
         reward = 0.0
-        if p_battery < 0:
-            reward += cheap_factor * energy_mwh * 20.0
-        if p_battery > 0:
-            reward += expensive_factor * energy_mwh * 20.0
-            # Extra bonus for discharging during peak hours
-            if hour in peak_hours:
-                reward += energy_mwh * 30.0  # Strong peak discharge bonus
 
-        soc_low_bound = 0.20
-        soc_high_bound = 0.80
-        if self.soc < soc_low_bound:
-            reward -= (soc_low_bound - self.soc) * 30.0
-        if self.soc > soc_high_bound:
-            reward -= (self.soc - soc_high_bound) * 30.0
+        # Penalize actions that move SOC without economic gain
+        idle_penalty = -0.1
+        charge_penalty = -0.2
+        discharge_penalty = -0.2
 
-        if (hour + 1) >= self.max_hours:
-            target_soc = 0.50
-            reward += -40.0 * abs(self.soc - target_soc)
-        
-        reward = reward / 25.0
+        # Bonuses for doing the right thing at the right time
+        if p_battery < -1e-3:  # Charging
+            if hour in self.cheapest_hours:
+                reward += cheap_factor * energy_mwh * 20.0
+            else:
+                reward += charge_penalty  # discourage unnecessary charging
+        elif p_battery > 1e-3:  # Discharging
+            if hour in self.peak_hours:
+                reward += expensive_factor * energy_mwh * 20.0
+            else:
+                reward += discharge_penalty  # discourage discharging outside peak
+        else:
+            reward += idle_penalty  # mild penalty to prevent too much idling
 
+        # Optional: scale final reward for stability
+        reward /= 10.0
+
+    
         future_features = getattr(self, "_latest_obs_future_features", {}) or {}
-        future_price_trend = float(future_features.get("future_price_trend_raw", 0.0))
-        delta_to_morning_peak = float(future_features.get("delta_to_morning_peak_raw", 0.0))
-        delta_to_evening_peak = float(future_features.get("delta_to_evening_peak_raw", 0.0))
         time_to_peak_hour_raw = float(future_features.get("time_to_peak_hour_raw", 0.0))
 
 
@@ -707,15 +656,11 @@ class BESSEnv(gym.Env):
             'energy_mwh': energy_mwh,
             'peak_hour': hour in peak_hours if isinstance(peak_hours, set) else False,
             'hours_to_peak': hours_to_peak,
-            'future_price_trend': future_price_trend,
-            'delta_to_morning_peak': delta_to_morning_peak,
-            'delta_to_evening_peak': delta_to_evening_peak,
             'time_to_peak_hour_raw': time_to_peak_hour_raw,
             'reward': reward,
             'reward_shaping': reward,
             'reward_base': 0.0,
             'reward_final': reward,
-            # 'terminal_soc_penalty': terminal_soc_penalty,
             'is_cheap_hour': hour in self.cheapest_hours if hasattr(self, 'cheapest_hours') else False,
             'dod_morning': self.dod_morning,
             'dod_evening': self.dod_evening,

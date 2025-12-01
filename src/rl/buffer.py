@@ -187,8 +187,8 @@ class ReplayBuffer:
                     n_step_dones[b, t] = done_flag
                     n_step_next_states[b, t] = self.next_states[final_idx]
 
-            batch["n_step_rewards"] = n_step_rewards[..., None]
-            batch["n_step_dones"] = n_step_dones[..., None]
+            batch["n_step_rewards"] = n_step_rewards
+            batch["n_step_dones"] = n_step_dones
             batch["n_step_next_states"] = n_step_next_states
 
         return batch

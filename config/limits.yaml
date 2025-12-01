@@ -32,9 +32,6 @@ bess:
   
   # Storage duration (hours) - how long battery can run at full power
   storage_duration_hours: 3.0
-  
-  # Expected annual cycles
-  expected_annual_cycles: 300
 
 # ============================================================================
 # Renewable Energy Source (RES) Specifications

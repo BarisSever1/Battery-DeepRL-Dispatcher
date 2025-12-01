@@ -87,9 +87,6 @@ class HourlyData:
     price_as_min: float  # Daily reserve min (EUR/MW·h, raw)
     price_as_max: float  # Daily reserve max (EUR/MW·h, raw)
     time_to_peak_hour: float
-    future_price_trend: float  # Future 6h average minus current price (EUR/MWh)
-    delta_to_morning_peak: float  # Price gap to upcoming morning peak (EUR/MWh)
-    delta_to_evening_peak: float  # Price gap to upcoming evening peak (EUR/MWh)
     time_to_peak_hour_raw: float  # Direct hours until next peak (capped placeholder)
 
 
@@ -289,9 +286,6 @@ def evaluate_td3_agent(
             # This denormalization happens AFTER the step, so it doesn't affect evaluation.
             # obs_vec contains the normalized state the agent saw before taking the action
             obs_features = denormalize_observation_features(env, obs_vec)
-            obs_features["future_price_trend"] = float(info.get("future_price_trend", 0.0))
-            obs_features["delta_to_morning_peak"] = float(info.get("delta_to_morning_peak", 0.0))
-            obs_features["delta_to_evening_peak"] = float(info.get("delta_to_evening_peak", 0.0))
             obs_features["time_to_peak_hour_raw"] = float(info.get("time_to_peak_hour_raw", obs_features.get("time_to_peak_hour", 0.0)))
 
             # Update cumulative totals
@@ -463,9 +457,6 @@ def evaluate_baseline_comprehensive(
             # This denormalization happens AFTER the step, so it doesn't affect evaluation.
             # obs_vec contains the normalized state the agent saw before taking the action
             obs_features = denormalize_observation_features(env, obs_vec)
-            obs_features["future_price_trend"] = float(info.get("future_price_trend", 0.0))
-            obs_features["delta_to_morning_peak"] = float(info.get("delta_to_morning_peak", 0.0))
-            obs_features["delta_to_evening_peak"] = float(info.get("delta_to_evening_peak", 0.0))
             obs_features["time_to_peak_hour_raw"] = float(info.get("time_to_peak_hour_raw", obs_features.get("time_to_peak_hour", 0.0)))
 
             # Update cumulative totals

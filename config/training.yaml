@@ -44,7 +44,9 @@ training:
 
 exploration:
   noise_type: Normal
-  noise_std: 0.5            # slightly higher for richer exploration
+  initial_noise_std: 1.0    # High initial exploration noise
+  final_noise_std: 0.1      # Low final exploration noise
+  noise_decay_episodes: 2200  # Decay over 2000 episodes
 
 evaluation:
   eval_every_epochs: 1

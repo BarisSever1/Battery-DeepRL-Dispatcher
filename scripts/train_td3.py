@@ -165,6 +165,58 @@ def _denorm_obs_features(env: BESSEnv, obs_vec: np.ndarray, soc_before: float) -
     return out
 
 
+def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float = 0.3) -> np.ndarray:
+    """
+    During warmup: mix rule-based hints (70%) with random actions (30%).
+    This ensures the agent sees both good behaviors and full action space coverage.
+    
+    Args:
+        env: The BESS environment
+        obs_vec: Normalized observation vector (18-dim)
+        random_prob: Probability of using pure random action (default 0.3)
+    
+    Returns:
+        Action array of shape (1,)
+    """
+    if random.random() < random_prob:
+        # 30% pure random to ensure full action space coverage
+        return env.action_space.sample().astype(np.float32)
+    
+    # 70% rule-based hints
+    try:
+        # Extract normalized features from observation
+        hour_norm = obs_vec[0]  # k (hour of day)
+        soc_norm = obs_vec[6]   # SOC
+        
+        # Denormalize to get actual values
+        hour = int(round(env._denormalize("k", hour_norm)))
+        hour = max(0, min(23, hour))  # Clamp to valid range
+        soc = env._denormalize("soc", soc_norm)
+        soc = max(0.0, min(1.0, soc))  # Clamp to valid range
+        
+        # Get peak/cheap hours from environment
+        cheapest_hours = getattr(env, "cheapest_hours", set())
+        peak_hours = getattr(env, "peak_hours", set())
+        
+        # Rule-based hints
+        if hour in cheapest_hours and soc < 0.7:
+            # Hint: charge during cheap hours if SOC is low
+            # Use moderate to strong charging
+            action = np.random.uniform(-1.0, -0.5, size=(1,)).astype(np.float32)
+        elif hour in peak_hours and soc > 0.3:
+            # Hint: discharge during peak hours if SOC is high
+            # Use moderate to strong discharging
+            action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
+        else:
+            # Mid-price or constraints: use random to explore
+            action = env.action_space.sample().astype(np.float32)
+        
+        return action
+    except Exception:
+        # Fallback to random if anything goes wrong
+        return env.action_space.sample().astype(np.float32)
+
+
 def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict[str, float]]:
     """Run a single-day deterministic rollout, return hourly rows (like eval)."""
     import numpy as _np
@@ -246,9 +298,6 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
             "cumulative_revenue": cumulative_revenue,
             "cumulative_degradation": cumulative_degradation,
             "cumulative_profit": cumulative_profit,
-            "future_price_trend": float(info.get("future_price_trend", 0.0)),
-            "delta_to_morning_peak": float(info.get("delta_to_morning_peak", 0.0)),
-            "delta_to_evening_peak": float(info.get("delta_to_evening_peak", 0.0)),
             "time_to_peak_hour_raw": float(info.get("time_to_peak_hour_raw", info.get("time_to_peak_hour", 0.0))),
             **obs_features,
         })
@@ -277,6 +326,11 @@ def main() -> None:
     algo_cfg = (yaml_cfg.get("algorithm") or {}) if isinstance(yaml_cfg, dict) else {}
     train_cfg = (yaml_cfg.get("training") or {}) if isinstance(yaml_cfg, dict) else {}
     exploration_cfg = (yaml_cfg.get("exploration") or {}) if isinstance(yaml_cfg, dict) else {}
+    
+    # Gaussian exploration decay parameters
+    initial_noise_std = float(exploration_cfg.get("initial_noise_std", 1.0)) if exploration_cfg else 1.0
+    final_noise_std = float(exploration_cfg.get("final_noise_std", 0.1)) if exploration_cfg else 0.1
+    noise_decay_episodes = int(exploration_cfg.get("noise_decay_episodes", 2000)) if exploration_cfg else 2000
 
     env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
     env.action_space.seed(args.seed)
@@ -299,7 +353,8 @@ def main() -> None:
     tau_val = float(algo_cfg.get("tau", args.tau)) if algo_cfg else args.tau
     actor_lr_val = float(algo_cfg.get("actor_lr", args.actor_lr if args.actor_lr is not None else args.lr))
     critic_lr_val = float(algo_cfg.get("critic_lr", args.critic_lr if args.critic_lr is not None else args.lr))
-    exploration_std_val = float(exploration_cfg.get("noise_std", args.exploration_std)) if exploration_cfg else args.exploration_std
+    # Use initial_noise_std for agent initialization (will be updated during training)
+    exploration_std_val = float(exploration_cfg.get("initial_noise_std", args.exploration_std)) if exploration_cfg else (args.exploration_std if args.exploration_std else 1.0)
     target_std_val = float(algo_cfg.get("target_noise", args.target_std)) if algo_cfg else args.target_std
     noise_clip_val = float(algo_cfg.get("noise_clip", args.noise_clip)) if algo_cfg else args.noise_clip
 
@@ -354,10 +409,32 @@ def main() -> None:
 
     episode_returns: List[float] = []
     print(f"Using device={device}, seed={args.seed}")
+    
+    # Calculate total episodes for noise decay
+    total_episodes = args.epochs * args.days_per_epoch
     print(f"Starting training on device {device} with {total_episodes} episodes")
+    print(f"Gaussian exploration noise: {initial_noise_std:.2f} -> {final_noise_std:.2f} over {noise_decay_episodes} episodes")
+    
+    def get_noise_std(episode: int) -> float:
+        """Calculate exploration noise std with linear decay."""
+        if episode < args.warmup_steps // 24:  # During warmup, use high noise
+            return initial_noise_std
+        progress = min(1.0, max(0.0, (episode - args.warmup_steps // 24) / noise_decay_episodes))
+        return initial_noise_std - (initial_noise_std - final_noise_std) * progress
 
     episode_counter = 0
     last_avg_return = float("nan")
+    warmup_complete_logged = False
+    
+    # Track action diversity during warmup
+    warmup_actions = {
+        'charge': 0,      # actions < -0.1
+        'idle': 0,        # -0.1 <= action <= 0.1
+        'discharge': 0,  # actions > 0.1
+        'total': 0,
+        'min_action': float('inf'),
+        'max_action': float('-inf')
+    }
 
     try:
         for epoch in range(args.epochs):
@@ -390,8 +467,27 @@ def main() -> None:
                     if len(obs_history) > args.seq_len:
                         obs_history.pop(0)
                     if len(buffer) < args.warmup_steps:
-                        action = env.action_space.sample().astype(np.float32)
+                        # Warmup: guided exploration (70% rule-based hints + 30% random)
+                        action = guided_warmup_action(env, obs_vec, random_prob=0.3)
+                        
+                        # Track action diversity
+                        warmup_actions['total'] += 1
+                        action_val = float(action[0])
+                        warmup_actions['min_action'] = min(warmup_actions['min_action'], action_val)
+                        warmup_actions['max_action'] = max(warmup_actions['max_action'], action_val)
+                        if action_val < -0.1:
+                            warmup_actions['charge'] += 1
+                        elif action_val > 0.1:
+                            warmup_actions['discharge'] += 1
+                        else:
+                            warmup_actions['idle'] += 1
                     else:
+                        # After warmup: Gaussian exploration with decay
+                        # Update agent's exploration std based on episode
+                        current_noise_std = get_noise_std(episode_counter)
+                        agent.config.exploration_std = current_noise_std
+                        
+                        # Policy action with Gaussian noise (noise added in agent.act)
                         state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
                         action_vec = agent.act(
                             state_seq,
@@ -414,6 +510,21 @@ def main() -> None:
                     obs_vec = next_obs_vec
 
                     if len(buffer) >= args.warmup_steps:
+                        # Log warmup summary once
+                        if not warmup_complete_logged and warmup_actions['total'] > 0:
+                            warmup_complete_logged = True
+                            total = warmup_actions['total']
+                            charge_pct = 100.0 * warmup_actions['charge'] / total
+                            idle_pct = 100.0 * warmup_actions['idle'] / total
+                            discharge_pct = 100.0 * warmup_actions['discharge'] / total
+                            action_range = warmup_actions['max_action'] - warmup_actions['min_action']
+                            print(f"\n[Warmup Complete] Buffer size: {len(buffer)}")
+                            print(f"  Action distribution: Charge={charge_pct:.1f}%, Idle={idle_pct:.1f}%, Discharge={discharge_pct:.1f}%")
+                            print(f"  Action range: [{warmup_actions['min_action']:.3f}, {warmup_actions['max_action']:.3f}] (span={action_range:.3f})")
+                            if action_range < 1.5:
+                                print(f"  WARNING: Action space coverage may be insufficient!")
+                            print()
+                        
                         for _ in range(args.updates_per_step):
                             stats = agent.update(buffer, batch_size=args.batch_size, seq_len=args.seq_len)
                             episode_update_stats.append(stats)
