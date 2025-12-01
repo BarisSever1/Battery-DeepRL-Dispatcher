@@ -101,8 +101,8 @@ class _CriticHead(nn.Module):
     """
     Single critic head: LSTM backbone + MLP predicting scalar Q-values.
 
-    Given a sequence of (state, action) pairs it produces a sequence of Q-values.
-    In our TD3 setup we typically only use the **last** time step.
+    Given a sequence of (state, action) pairs it produces Q-values for ALL time steps.
+    This enables sequence returns learning where we learn from all time steps in each sequence.
     """
 
     def __init__(
@@ -135,8 +135,8 @@ class _CriticHead(nn.Module):
         # Encode the whole sequence, then push through the MLP
         lstm_out, hidden_out = self.lstm(x, hidden)
         features = self.backbone(lstm_out)
-        # Return Q-value only for the last time step (shape [B,1,1])
-        q_values = self.head(features[:, -1:, :])
+        # Return Q-values for ALL time steps (shape [B,T,1]) for sequence returns
+        q_values = self.head(features)  # [B, T, 1]
         return LSTMOutput(outputs=q_values, hidden=hidden_out)
 
 
