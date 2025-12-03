@@ -1,0 +1,6 @@
+﻿#### Changes from Dec2_v6 to Dec3_v1:  
+
+- tau: 0.01 (increased from 0.005) — faster target network updates to reduce lag with distribution shift
+- Learning rate: 3e-5 (reduced from 5e-5) — prevents overshooting with distribution shift
+- Gradient clipping: 2.0 (increased from 1.0) — allows larger updates when dealing with distribution shift
+- Target Q clipping: [-1000, 1000] (increased from [-200, 200]) — prevents underestimation

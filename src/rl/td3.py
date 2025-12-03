@@ -27,9 +27,9 @@ class TD3Config:
     gamma: float = 0.995
     n_step: int = 1
     use_n_step: bool = True
-    tau: float = 0.01
+    tau: float = 0.01  # Increased from 0.005 to reduce target network lag with distribution shift
     policy_delay: int = 2
-    lr: float = 7e-5
+    lr: float = 3e-5  # Reduced from 5e-5 to prevent overshooting with distribution shift
     actor_lr: Optional[float] = None
     critic_lr: Optional[float] = None
     exploration_std: float = 0.5
@@ -136,12 +136,14 @@ class TD3Agent:
             actions_last = action_seq[:, -1:, :]  # [B,1,A]
 
             if not eval_mode:
-                # Add Gaussian exploration noise during training (unclipped for better exploration)
+                # Add Gaussian exploration noise during training
                 noise = torch.randn_like(actions_last) * float(self.config.exploration_std)
-                # Noise clipping removed to allow sign flips (e.g., -0.9 + noise can become positive)
+                # Clip noise to prevent extreme actions that could destabilize training
+                # Use the same noise_clip as target policy smoothing for consistency
+                noise = noise.clamp(-self.config.noise_clip, self.config.noise_clip)
                 actions_last = actions_last + noise
 
-            # Clamp action to the legal range
+            # Clamp action to the legal range (critical for stability)
             actions_last = actions_last.clamp(self.config.action_low, self.config.action_high)
             actions_np = actions_last.squeeze(1).cpu().numpy()
 
@@ -253,6 +255,15 @@ class TD3Agent:
             rewards_expanded = rewards_all.unsqueeze(-1)  # [B, T, 1]
             dones_expanded = dones_all.unsqueeze(-1)  # [B, T, 1]
             target_q_all = rewards_expanded + (1.0 - dones_expanded) * self.config.gamma * min_q_next  # [B, T, 1]
+            
+            # Clip target Q-values to prevent Q-value collapse
+            # This prevents negative feedback loops where very negative Q-values
+            # become targets, causing the critic to learn even more negative Q-values
+            # Clip to reasonable range based on reward scale (rewards are clipped to [-40, 40])
+            # With gamma=0.995, max theoretical Q-value ≈ 40 / (1 - gamma) ≈ 8000
+            # Increased from [-200, 200] to [-1000, 1000] to prevent underestimation
+            # while still preventing extreme outliers from destabilizing training
+            target_q_all = torch.clamp(target_q_all, min=-1000.0, max=1000.0)
 
         # ---- 3) Critic update: fit Q(s_{1:T}, a_{1:T}) to target_q for ALL time steps ----
         q1_current, q2_current = self.critic(states_seq, actions_for_critic)
@@ -268,7 +279,8 @@ class TD3Agent:
         # Backprop through both critics
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+        # Increased gradient clipping to 2.0 to allow larger updates when dealing with distribution shift
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=2.0)
         self.critic_optimizer.step()
 
         actor_loss = torch.zeros(1, device=self.device)
@@ -280,7 +292,11 @@ class TD3Agent:
             if actor_actions_full.dim() == 2:
                 actor_actions_full = actor_actions_full.unsqueeze(1)
             # Use the full policy-generated action sequence
-            actor_actions_seq = actor_actions_full
+            # Clip actor actions to ensure they're in valid range (safety check)
+            # Actor outputs tanh, so should already be in [-1, 1], but explicit clipping prevents issues
+            actor_actions_seq = actor_actions_full.clamp(
+                self.config.action_low, self.config.action_high
+            )
             q1_actor, q2_actor = self.critic(states_seq, actor_actions_seq)
             # Use min(Q1, Q2) for actor update (TD3 standard: clipped double-Q for actor)
             # This prevents overestimation bias and makes the actor more conservative

@@ -610,8 +610,9 @@ class BESSEnv(gym.Env):
         # - Max reserve: 20 MW × 50 €/MW·h × 1 hour = 1000 €  
         # - Max PV: 20 MW × 150 €/MWh × 1 hour = 3000 €
         # - Total max: ~4000 € per hour
-        # - Normalize to range -10 to +10: factor = 4000 / 10 = 400
-        normalization_factor = 400.0  # Fixed: ensures consistent reward scale across all episodes
+        # - Normalize to range -20 to +20: factor = 4000 / 20 = 200
+        # Reduced from 400 to 200 to increase reward scale and prevent Q-value underestimation
+        normalization_factor = 100.0  # Fixed: ensures consistent reward scale across all episodes
         
         # This makes rewards comparable across different days/price levels
         # and prevents the Q-value collapse we're seeing
@@ -634,14 +635,15 @@ class BESSEnv(gym.Env):
         # === 1) CHARGE BONUS: Economics-aligned arbitrage opportunity ===
         # Reward charging when there's a clear economic opportunity (cheap now, expensive later)
         # Need to overcome negative raw reward from buying energy, so bonus must be substantial
+        # With normalization_factor = 100, rewards are 2x larger than factor=200, so scale bonuses accordingly
         if p_battery < -1e-3:  # Charging
             soc_headroom = max(0.0, self.soc_max - self.soc)
             if soc_headroom > 0.05:  # Only if there's room to charge
                 # Base bonus for charging during cheap hours (encourages exploration)
                 # This helps agent learn that charging can be profitable
                 if hour in self.cheapest_hours:
-                    # Base normalized bonus: 0.5-1.5 depending on how cheap
-                    base_charge_bonus = cheap_factor * 1.0  # Up to 1.0 normalized bonus
+                    # Base normalized bonus: 1.0-2.0 depending on how cheap (scaled 2x for factor=100)
+                    base_charge_bonus = cheap_factor * 4.0  # Up to 2.0 normalized bonus
                     base_charge_bonus *= min(1.0, soc_headroom / 0.2)  # Reduce if low headroom
                     shaping_bonus_normalized += base_charge_bonus
                 
@@ -652,7 +654,7 @@ class BESSEnv(gym.Env):
                     expected_arbitrage_profit = price_spread * energy_mwh
                     # Normalize the expected profit
                     normalized_expected_profit = expected_arbitrage_profit / normalization_factor
-                    # Give a substantial bonus (15-25% of expected profit) to strongly encourage charging
+                    # Give a substantial bonus (20% of expected profit) to strongly encourage charging
                     # This needs to be large enough to overcome negative raw reward
                     arbitrage_bonus = normalized_expected_profit * 0.20  # 20% of normalized expected profit
                     arbitrage_bonus *= cheap_factor  # More bonus when price is very cheap
@@ -661,33 +663,36 @@ class BESSEnv(gym.Env):
         
         # === 2) DISCHARGE REINFORCEMENT: Small signal for peak discharge ===
         # Discharging during peak is already profitable (positive revenue_energy in raw_reward)
-        # Add a very small normalized bonus (0.1-0.5) to reinforce this behavior
+        # Add a small normalized bonus to reinforce this behavior
+        # With normalization_factor = 100, scale bonus proportionally
         if p_battery > 1e-3:  # Discharging
             if hour in peak_hours:
-                # Small normalized bonus proportional to energy discharged
-                # Max discharge (20 MW × 1 hour) normalized = ~10, so bonus should be ~0.1-0.3
+                # Normalized bonus proportional to energy discharged
+                # Max discharge (20 MW × 1 hour) normalized = ~20 with factor=100, so bonus should be ~0.2-0.4
                 normalized_energy = energy_mwh / (self.P_bess_max * dt)  # Fraction of max capacity
-                discharge_bonus = expensive_factor * normalized_energy * 0.2  # 0.2 max bonus
+                discharge_bonus = expensive_factor * normalized_energy * 0.8  # 0.8 max bonus (scaled 2x)
                 shaping_bonus_normalized += discharge_bonus
         
         # === 3) SOC CONSTRAINT PENALTIES (prevent infeasible states) ===
         # These are operational constraints, not economic shaping
-        # Penalties in normalized space: -0.5 to -2.0 (small relative to economic rewards)
+        # Penalties in normalized space: -1.0 to -2.0 (small relative to economic rewards)
+        # Scaled 2x for normalization_factor = 100
         if self.soc >= self.soc_max - 0.01:  # At max SOC
             if p_battery < -1e-3:  # Trying to charge when full
-                shaping_bonus_normalized -= 1.0  # Small normalized penalty
+                shaping_bonus_normalized -= 4.0  # Small normalized penalty (scaled 2x)
         
         if self.soc <= self.soc_min + 0.01:  # At min SOC
             if p_battery > 1e-3:  # Trying to discharge when empty
-                shaping_bonus_normalized -= 1.0  # Small normalized penalty
+                shaping_bonus_normalized -= 4.0  # Small normalized penalty (scaled 2x)
         
         # === FINAL REWARD: Normalized economics + normalized shaping ===
         normalized_raw_reward = raw_reward / normalization_factor
         reward = normalized_raw_reward + shaping_bonus_normalized
         
         # Clip for stability (normalized rewards should be in reasonable range)
-        # With adaptive normalization, rewards typically stay in -15 to +15 range
-        reward = float(np.clip(reward, -20.0, 20.0))
+        # With normalization_factor = 100, max theoretical reward per hour = 4000/100 = 40
+        # Clip to [-40, 40] to allow full range, but keep it reasonable for RL stability
+        reward = float(np.clip(reward, -40.0, 40.0))
 
 
     

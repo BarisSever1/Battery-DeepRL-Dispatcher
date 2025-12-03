@@ -554,6 +554,8 @@ def main() -> None:
                         "actor_loss": _avg("actor_loss"),
                         "q1_mean": _avg("q1_mean"),
                         "q2_mean": _avg("q2_mean"),
+                        "q1_mean_all": _avg("q1_mean_all"),
+                        "q2_mean_all": _avg("q2_mean_all"),
                     }
                     try:
                         with training_metrics_path.open("a", encoding="utf-8") as tm_file:
