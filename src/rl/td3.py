@@ -29,7 +29,7 @@ class TD3Config:
     use_n_step: bool = True
     tau: float = 0.01
     policy_delay: int = 2
-    lr: float = 5e-5
+    lr: float = 7e-5
     actor_lr: Optional[float] = None
     critic_lr: Optional[float] = None
     exploration_std: float = 0.5
