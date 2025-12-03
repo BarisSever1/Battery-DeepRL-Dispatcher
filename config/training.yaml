@@ -3,12 +3,12 @@
 algorithm:
   name: TD3
   gamma: 0.995        # discount factor (0.99 for stability, avoids exploding Q-values)
-  tau: 0.01              # Polyak (increased to reduce target network lag with distribution shift)
+  tau: 0.01              # Polyak (slower target updates for stability)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)
-  noise_clip: 0.5
-  actor_lr: 3e-5  # Reduced to prevent overshooting with distribution shift
-  critic_lr: 3e-5
+  noise_clip: 0.4
+  actor_lr: 5e-5
+  critic_lr: 5e-5
   optimizer: Adam
   normalize_reward: false  # rewards already in physical units
 
