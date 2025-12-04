@@ -1,6 +1,36 @@
-﻿#### Changes from Dec2_v6 to Dec3_v1:  
+﻿#### Changes from Dec3_v6 (good working in action)
 
-- tau: 0.01 (increased from 0.005) — faster target network updates to reduce lag with distribution shift
-- Learning rate: 3e-5 (reduced from 5e-5) — prevents overshooting with distribution shift
-- Gradient clipping: 2.0 (increased from 1.0) — allows larger updates when dealing with distribution shift
-- Target Q clipping: [-1000, 1000] (increased from [-200, 200]) — prevents underestimation
+-Dec3 v7: removed reward clipping, scaled it down instead
+results: now it cycles hard(charge/discharge) , timing is ok
+q values still collapsing after some training, I think it overfits. 
+
+#### Changes from dec_v7 
+
+- Dec3 v8 aligned tau from config and td3 default (tau 0.05)
+- critic learning rate is 5e-5 from 1e-4
+-q value clipping to 1000, -1000
+
+#### Changes from dec_v8 
+
+- Dec3 v9 doesnt include hidden state logic, it was off but now removed from code
+The training will:
+Allow hard cycling during peak/cheap hours (no cycle penalty)
+Penalize wasteful cycling during mid-price hours (0.4 × degradation cost)
+Ensure degradation cost dominates the reward signal for wasteful cycling
+
+result: in later training it got well. beginnings were shit. but critic loss always improved.
+
+#### Changes from dec_v9 
+
+Dec4 v1:
+- actor lr -> 7e - 5
+- tau : 0.01
+- batch size : 128 
+
+Reward shaping for two-cycle strategy (encourages charging between morning and evening peaks)
+
+
+
+
+
+

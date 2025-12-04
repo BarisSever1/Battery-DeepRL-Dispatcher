@@ -614,17 +614,21 @@ class BESSEnv(gym.Env):
         
         # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
         # This is the main profit opportunity - reward it very strongly
+        # SCALED DOWN: Removed clipping, so rewards are proportional to energy
+        # Small actions get small rewards, large actions get large rewards
         if p_battery > 1e-3:  # Discharging
             if hour in self.peak_hours:
-                # Strong base reward + energy-scaled bonus
-                base_peak_reward = 15.0  # Base reward for attempting peak discharge
-                energy_bonus = expensive_factor * energy_mwh * 20.0  # Up to +20 per MWh
+                # Strong base reward + energy-scaled bonus (scaled down for no clipping)
+                base_peak_reward = 5.0  # Base reward for attempting peak discharge (reduced from 15.0)
+                energy_bonus = expensive_factor * energy_mwh * 5.0  # 5.0 per MWh (reduced from 20.0)
+                # Max theoretical: 5.0 + 1.0 * 20 * 5.0 = 105.0 for full discharge
                 reward += base_peak_reward + energy_bonus
             else:
                 # Discharging outside peak = missed opportunity
                 reward += -5.0  # Strong penalty for misaligned discharge
         
         # === 2) CHEAP HOUR CHARGING (WITH SOC HEADROOM CONSTRAINT) ===
+        # SCALED DOWN: Removed clipping, so rewards are proportional to energy
         elif p_battery < -1e-3:  # Charging
             if hour in self.cheapest_hours:
                 # Reward charging during cheap hours, but penalize if too close to max SOC
@@ -635,25 +639,49 @@ class BESSEnv(gym.Env):
                     # Before upcoming peak hours: reward charging but penalize approaching max SOC
                     # This prevents charging to max before morning OR evening peak
                     if soc_headroom > 0.15:  # Good headroom (>15% remaining)
-                        base_charge_reward = 8.0
-                        energy_bonus = cheap_factor * energy_mwh * 15.0
+                        base_charge_reward = 3.0  # Reduced from 8.0
+                        energy_bonus = cheap_factor * energy_mwh * 4.0  # 4.0 per MWh (reduced from 15.0)
+                        # Max theoretical: 3.0 + 1.0 * 20 * 4.0 = 83.0 for full charge
                         reward += base_charge_reward + energy_bonus
                     elif soc_headroom > 0.05:  # Moderate headroom (5-15%)
                         # Diminishing returns - still reward but less
-                        base_charge_reward = 4.0
-                        energy_bonus = cheap_factor * energy_mwh * 10.0
+                        base_charge_reward = 2.0  # Reduced from 4.0
+                        energy_bonus = cheap_factor * energy_mwh * 2.5  # 2.5 per MWh (reduced from 10.0)
+                        # Max theoretical: 2.0 + 1.0 * 20 * 2.5 = 52.0 for full charge
                         reward += base_charge_reward + energy_bonus
                     else:  # Too close to max SOC (<5% headroom)
                         # Strong penalty for charging when already near max
                         reward += -10.0  # Penalty for charging to max too early
                 else:
                     # After all peak hours: charging is less valuable (end of day)
-                    base_charge_reward = 5.0
-                    energy_bonus = cheap_factor * energy_mwh * 10.0
+                    base_charge_reward = 2.0  # Reduced from 5.0
+                    energy_bonus = cheap_factor * energy_mwh * 2.5  # 2.5 per MWh (reduced from 10.0)
+                    # Max theoretical: 2.0 + 1.0 * 20 * 2.5 = 52.0 for full charge
                     reward += base_charge_reward + energy_bonus
             else:
-                # Charging outside cheap hours = suboptimal
-                reward += -3.0  # Penalty for misaligned charge
+                # Charging outside cheap hours
+                # BUT: Allow charging between peaks if SOC is low and evening peak is coming
+                # This enables the second cycle (charge between morning and evening peaks)
+                if has_upcoming_peak and self.soc < 0.3:
+                    # Low SOC with upcoming peak: reward charging to prepare for evening peak
+                    # This is critical for two-cycle strategy
+                    soc_headroom = self.soc_max - self.soc
+                    if soc_headroom > 0.15:  # Good headroom
+                        # Reward charging between peaks, but less than during cheapest hours
+                        base_charge_reward = 2.0  # Base reward for preparing for evening peak
+                        # Use price factor (cheaper = better, but not as strong as cheapest hours)
+                        price_factor = max(0.0, (price_max - price_em) / price_range)  # How cheap relative to max
+                        energy_bonus = price_factor * energy_mwh * 2.0  # 2.0 per MWh (scaled by price)
+                        reward += base_charge_reward + energy_bonus
+                    elif soc_headroom > 0.05:  # Moderate headroom
+                        base_charge_reward = 1.0
+                        price_factor = max(0.0, (price_max - price_em) / price_range)
+                        energy_bonus = price_factor * energy_mwh * 1.5
+                        reward += base_charge_reward + energy_bonus
+                    # If too close to max, no reward (but also no penalty - let cycle penalty handle it)
+                else:
+                    # Charging outside cheap hours without good reason = suboptimal
+                    reward += -3.0  # Penalty for misaligned charge
         
         # === 3) IDLING REWARDS/PENALTIES ===
         else:  # Idling (p_battery ≈ 0)
@@ -689,9 +717,52 @@ class BESSEnv(gym.Env):
         if hour in self.peak_hours and self.soc <= self.soc_min + 0.05:
             reward += -15.0  # Strong penalty for empty battery at peak
 
+        # === 5) CONTEXT-AWARE CYCLE PENALTY (tied to degradation cost) ===
+        # Penalize unnecessary cycling when arbitrage opportunity doesn't make sense
+        # Allow hard cycling during peaks/cheap hours, penalize wasteful cycling during normal hours
+        # Balanced with degradation cost to encourage efficient use of battery cycles
+        cycle_penalty = 0.0
+        is_good_cycling = None
+        
+        if abs(p_battery) > 1e-3:  # Only apply when actually cycling (not idling)
+            # Determine if cycling makes sense in current context
+            is_good_cycling = False
+            
+            if p_battery > 1e-3:  # Discharging
+                # Good to discharge during peak hours
+                if hour in self.peak_hours:
+                    is_good_cycling = True
+            elif p_battery < -1e-3:  # Charging
+                # Good to charge during cheap hours (if there's headroom)
+                if hour in self.cheapest_hours and (self.soc_max - self.soc) > 0.05:
+                    is_good_cycling = True
+            
+            # Apply penalty only when cycling doesn't make sense
+            # Penalty is proportional to degradation cost to ensure wasteful cycling is strongly discouraged
+            # Scale: 0.4 * degradation_cost for wasteful cycling during mid-price hours
+            # This ensures that even with potential energy trading revenue, net reward is negative
+            # Example: Full discharge (20 MWh) during mid-price hour
+            #   - Degradation cost: ~50.0 EUR
+            #   - Misaligned penalty: -5.0 EUR
+            #   - Cycle penalty: -0.4 * 50.0 = -20.0 EUR
+            #   - Total penalty: -75.0 EUR (dominates any small trading revenue)
+            if not is_good_cycling:
+                # Wasteful cycling: penalize proportionally to degradation cost
+                # The 0.4 factor ensures degradation cost dominates the reward signal
+                # Max penalty would be ~0.4 * max_degradation_cost (~0.4 * 50 = ~20.0)
+                # Combined with misaligned penalty (-5.0 or -3.0), total is ~-25.0 to -23.0
+                # This ensures net reward is negative even if small energy trading revenue exists
+                cycle_penalty = -cost_degradation * 0.4
+                reward += cycle_penalty
+            # else: Good cycling - no additional penalty (degradation cost already accounts for it)
 
-        # Clip for stability (large range to accommodate strong signals)
-        reward = float(np.clip(reward, -50.0, 50.0))
+        # NO CLIPPING: Rewards are now proportional to action magnitude
+        # Small actions get small rewards, large actions get large rewards
+        # This ensures the agent can distinguish between different action magnitudes
+        # Small rewards/penalties (e.g., +3.0, +5.0, -3.0) remain meaningful relative to larger ones
+        # Max theoretical reward: ~105.0 (full discharge at peak)
+        # Max theoretical penalty: ~-25.0 (idle at peak with full SOC)
+        reward = float(reward)  # Convert to float but NO clipping - preserve all reward signals
 
 
     
@@ -705,6 +776,10 @@ class BESSEnv(gym.Env):
         self.episode_degradation += cost_degradation
 
         info = {
+            # CYCLE PENALTY TRACKING (first, as requested)
+            'cycle_penalty': cycle_penalty,  # Context-aware cycle penalty applied
+            'is_good_cycling': is_good_cycling,  # Whether cycling makes sense (None if idling)
+            
             'hour': hour,
             'delta': delta,
             'soc_previous': self.soc_previous,

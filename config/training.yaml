@@ -3,12 +3,12 @@
 algorithm:
   name: TD3
   gamma: 0.995        # discount factor (0.99 for stability, avoids exploding Q-values)
-  tau: 0.005              # Polyak (slower target updates for stability)
+  tau: 0.01              # Polyak (faster target updates to track policy changes better)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)
   noise_clip: 0.4
-  actor_lr: 1e-4
-  critic_lr: 1e-4
+  actor_lr: 7e-5
+  critic_lr: 7e-5  # Balanced learning rate for both networks
   optimizer: Adam
   normalize_reward: false  # rewards already in physical units
 
@@ -30,7 +30,7 @@ training:
   max_episode_length: 24
   epochs: 100                  # long training run
   train_days_per_epoch: 22  
-  batch_size: 64
+  batch_size: 128
   buffer_size: 1000000        # 1e6 per paper
   min_buffer_size: 20000
   sequence_length: 24         # 24-step sequences
