@@ -27,7 +27,7 @@ class TD3Config:
     gamma: float = 0.995
     n_step: int = 1
     use_n_step: bool = True
-    tau: float = 0.01
+    tau: float = 0.005  # Reduced from 0.01 to help with target network stability and critic overfitting
     policy_delay: int = 2
     lr: float = 7e-5
     actor_lr: Optional[float] = None
@@ -125,9 +125,7 @@ class TD3Agent:
         with torch.no_grad():
             state_tensor = torch.as_tensor(state_seq, dtype=torch.float32, device=self.device)
             # ActorLSTM returns an action for every time step in the sequence
-            action_seq, hidden = self.actor(state_tensor)
-            # We do not use the hidden state outside, so just detach it
-            hidden = tuple(h.detach() for h in hidden)
+            action_seq = self.actor(state_tensor)
 
             if action_seq.dim() == 2:  # [B,A] -> [B,1,A]
                 action_seq = action_seq.unsqueeze(1)
@@ -210,8 +208,7 @@ class TD3Agent:
         with torch.no_grad():
             # Get next actions for all next states in the sequence
             # next_states_seq[:, t, :] is the next state after states_seq[:, t, :]
-            next_actions_full, hidden_next = self.actor_target(next_states_seq)
-            hidden_next = tuple(h.detach() for h in hidden_next)
+            next_actions_full = self.actor_target(next_states_seq)
             if next_actions_full.dim() == 2:
                 next_actions_full = next_actions_full.unsqueeze(1)
 
@@ -242,8 +239,6 @@ class TD3Agent:
 
             # Compute Q-values for next states (all time steps)
             q1_next, q2_next = self.critic_target(next_states_seq, next_actions_seq)
-            q1_next_hidden = tuple(h.detach() for h in q1_next.hidden)
-            q2_next_hidden = tuple(h.detach() for h in q2_next.hidden)
             # Clipped double‑Q: take the smaller of the two target critics for all time steps
             min_q_next = torch.min(q1_next.outputs, q2_next.outputs)  # [B, T, 1]
             
@@ -253,6 +248,11 @@ class TD3Agent:
             rewards_expanded = rewards_all.unsqueeze(-1)  # [B, T, 1]
             dones_expanded = dones_all.unsqueeze(-1)  # [B, T, 1]
             target_q_all = rewards_expanded + (1.0 - dones_expanded) * self.config.gamma * min_q_next  # [B, T, 1]
+            
+            # Clip target Q-values to prevent extreme targets that can cause critic overfitting
+            # This helps stabilize training when rewards are large (e.g., up to ~105 for full discharge)
+            # Clipping range: [-1000, 1000] allows for reasonable Q-values while preventing explosions
+            target_q_all = torch.clamp(target_q_all, min=-1000.0, max=1000.0)
 
         # ---- 3) Critic update: fit Q(s_{1:T}, a_{1:T}) to target_q for ALL time steps ----
         q1_current, q2_current = self.critic(states_seq, actions_for_critic)
@@ -275,8 +275,7 @@ class TD3Agent:
         if self.total_it % self.config.policy_delay == 0:
             # ---- 4) Actor update: improve policy a = π(s_{1:T}) ----
             # For sequence returns: maximize Q-values for ALL time steps in the sequence
-            actor_actions_full, actor_hidden = self.actor(states_seq)
-            actor_hidden = tuple(h.detach() for h in actor_hidden)
+            actor_actions_full = self.actor(states_seq)
             if actor_actions_full.dim() == 2:
                 actor_actions_full = actor_actions_full.unsqueeze(1)
             # Use the full policy-generated action sequence

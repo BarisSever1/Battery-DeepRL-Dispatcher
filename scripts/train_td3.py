@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-std", type=float, default=0.5, help="Std dev of target policy smoothing noise")
     parser.add_argument("--noise-clip", type=float, default=0.4, help="Clamp for target policy smoothing noise")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--tau", type=float, default=0.01, help="Polyak averaging factor")
+    parser.add_argument("--tau", type=float, default=0.005, help="Polyak averaging factor (reduced default to help with critic overfitting)")
     parser.add_argument("--policy-delay", type=int, default=2, help="Delayed policy update interval")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for actor/critic")
     parser.add_argument("--actor-lr", type=float, default=None, help="Optional override for actor learning rate")

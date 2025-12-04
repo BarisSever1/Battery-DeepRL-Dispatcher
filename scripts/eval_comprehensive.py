@@ -218,8 +218,6 @@ def evaluate_td3_agent(
     EVAL_SEQ_LEN = 24
 
     for date in test_dates:
-        if hasattr(agent.actor, "reset_hidden_state"):
-            agent.actor.reset_hidden_state(batch_size=1)
         # Reset environment with specific date
         obs, _ = env.reset(seed=seed, options={"date": date})
         obs_vec = np.asarray(obs, dtype=np.float32)
