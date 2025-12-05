@@ -603,21 +603,24 @@ class BESSEnv(gym.Env):
         
         # Get next upcoming peak hour for timing checks
         # This handles both morning and evening peaks correctly
-        next_peak_hour = None
+        next_peak_hour_shaping = None
         if self.peak_hours:
             for h in sorted(self.peak_hours):
                 if h >= hour:
-                    next_peak_hour = h
+                    next_peak_hour_shaping = h
                     break
         # If no peak hour found, we're past all peaks (use 24 as sentinel)
-        has_upcoming_peak = next_peak_hour is not None
+        has_upcoming_peak = next_peak_hour_shaping is not None
         
         # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
         # This is the main profit opportunity - reward it very strongly
         # SCALED DOWN: Removed clipping, so rewards are proportional to energy
         # Small actions get small rewards, large actions get large rewards
         if p_battery > 1e-3:  # Discharging
-            if hour in self.peak_hours:
+            # First check: if already at min SOC, penalize immediately (no rewards)
+            if self.soc <= self.soc_min + 0.05:
+                reward += -15.0  # Strong penalty for trying to discharge at min SOC
+            elif hour in self.peak_hours:
                 # Strong base reward + energy-scaled bonus (scaled down for no clipping)
                 base_peak_reward = 5.0  # Base reward for attempting peak discharge (reduced from 15.0)
                 energy_bonus = expensive_factor * energy_mwh * 5.0  # 5.0 per MWh (reduced from 20.0)
@@ -630,7 +633,10 @@ class BESSEnv(gym.Env):
         # === 2) CHEAP HOUR CHARGING (WITH SOC HEADROOM CONSTRAINT) ===
         # SCALED DOWN: Removed clipping, so rewards are proportional to energy
         elif p_battery < -1e-3:  # Charging
-            if hour in self.cheapest_hours:
+            # First check: if already at max SOC, penalize immediately (no rewards)
+            if self.soc >= self.soc_max - 0.05:
+                reward += -20.0  # Very strong penalty for trying to charge at max SOC
+            elif hour in self.cheapest_hours:
                 # Reward charging during cheap hours, but penalize if too close to max SOC
                 # This prevents the local optimum of charging to max too early
                 soc_headroom = self.soc_max - self.soc
@@ -678,7 +684,7 @@ class BESSEnv(gym.Env):
                         price_factor = max(0.0, (price_max - price_em) / price_range)
                         energy_bonus = price_factor * energy_mwh * 1.5
                         reward += base_charge_reward + energy_bonus
-                    # If too close to max, no reward (but also no penalty - let cycle penalty handle it)
+                    # If too close to max, no reward (but also no penalty - let arbitrage handle it)
                 else:
                     # Charging outside cheap hours without good reason = suboptimal
                     reward += -3.0  # Penalty for misaligned charge
@@ -687,9 +693,12 @@ class BESSEnv(gym.Env):
         else:  # Idling (p_battery ≈ 0)
             if hour in self.peak_hours:
                 # Idling during peak = missed major opportunity
-                if self.soc > self.soc_max - 0.05:
+                if self.soc >= 0.85:  # High SOC (>= 85%) at peak = worst case
                     # Full SOC at peak = worst case
                     reward += -25.0  # Very strong penalty
+                elif self.soc <= self.soc_min + 0.05:
+                    # At min SOC - can't discharge anyway, but still poor planning
+                    reward += -5.0  # Moderate penalty (less than if could discharge)
                 else:
                     # Can discharge but choosing not to
                     reward += -8.0  # Strong penalty for idling at peak
@@ -698,8 +707,13 @@ class BESSEnv(gym.Env):
                 reward += -4.0  # Moderate penalty
             else:
                 # Idling during normal hours = acceptable strategy
-                # Preserves battery state, avoids unnecessary degradation
-                reward += 5.0  # Small reward for smart idling
+                # BUT: If SOC is very low, it's a missed opportunity to charge
+                if self.soc < 0.3:
+                    # Low SOC - should have charged, missed opportunity
+                    reward += 0.0  # No reward, but no strong penalty either
+                else:
+                    # Preserves battery state, avoids unnecessary degradation
+                    reward += 5.0  # Small reward for smart idling
         
         # === 4) ADDITIONAL CONSTRAINTS ===
         # Penalize reaching max SOC before upcoming peak hours (critical for breaking local optimum)
@@ -716,45 +730,103 @@ class BESSEnv(gym.Env):
         # Penalize being at min SOC during peak hours (can't discharge)
         if hour in self.peak_hours and self.soc <= self.soc_min + 0.05:
             reward += -15.0  # Strong penalty for empty battery at peak
-
-        # === 5) CONTEXT-AWARE CYCLE PENALTY (tied to degradation cost) ===
-        # Penalize unnecessary cycling when arbitrage opportunity doesn't make sense
-        # Allow hard cycling during peaks/cheap hours, penalize wasteful cycling during normal hours
-        # Balanced with degradation cost to encourage efficient use of battery cycles
-        cycle_penalty = 0.0
-        is_good_cycling = None
         
-        if abs(p_battery) > 1e-3:  # Only apply when actually cycling (not idling)
-            # Determine if cycling makes sense in current context
-            is_good_cycling = False
-            
-            if p_battery > 1e-3:  # Discharging
-                # Good to discharge during peak hours
-                if hour in self.peak_hours:
-                    is_good_cycling = True
-            elif p_battery < -1e-3:  # Charging
-                # Good to charge during cheap hours (if there's headroom)
-                if hour in self.cheapest_hours and (self.soc_max - self.soc) > 0.05:
-                    is_good_cycling = True
-            
-            # Apply penalty only when cycling doesn't make sense
-            # Penalty is proportional to degradation cost to ensure wasteful cycling is strongly discouraged
-            # Scale: 0.4 * degradation_cost for wasteful cycling during mid-price hours
-            # This ensures that even with potential energy trading revenue, net reward is negative
-            # Example: Full discharge (20 MWh) during mid-price hour
-            #   - Degradation cost: ~50.0 EUR
-            #   - Misaligned penalty: -5.0 EUR
-            #   - Cycle penalty: -0.4 * 50.0 = -20.0 EUR
-            #   - Total penalty: -75.0 EUR (dominates any small trading revenue)
-            if not is_good_cycling:
-                # Wasteful cycling: penalize proportionally to degradation cost
-                # The 0.4 factor ensures degradation cost dominates the reward signal
-                # Max penalty would be ~0.4 * max_degradation_cost (~0.4 * 50 = ~20.0)
-                # Combined with misaligned penalty (-5.0 or -3.0), total is ~-25.0 to -23.0
-                # This ensures net reward is negative even if small energy trading revenue exists
-                cycle_penalty = -cost_degradation * 0.4
-                reward += cycle_penalty
-            # else: Good cycling - no additional penalty (degradation cost already accounts for it)
+        # Penalize discharging when already at min SOC (regardless of hour)
+        # Note: This is checked here as a fallback, but should be caught in discharge logic above
+        if p_battery > 1e-3 and self.soc <= self.soc_min + 0.05:
+            reward += -15.0  # Strong penalty for trying to discharge at min SOC
+
+        # === 5) ARBITRAGE-SENSITIVE NET PROFIT (replaces cycle penalty) ===
+        # Calculate net profitability: arbitrage opportunity - degradation cost
+        # This allows the agent to learn optimal cycling based on economic trade-offs
+        # The agent can find the optimal cycling amount based on degradation and arbitrage
+        
+        # Calculate degradation per MWh for net profitability calculation
+        degradation_per_mwh = cost_degradation / max(energy_mwh, 1e-6)
+        
+        # Calculate arbitrage opportunity per MWh
+        arbitrage_per_mwh = 0.0
+        next_peak_price = None
+        previous_cheap_price = None
+        
+        # Get next peak hour and price for arbitrage calculation (reuse next_peak_hour_shaping if available)
+        next_peak_hour_arb = next_peak_hour_shaping
+        if next_peak_hour_arb is None and self.peak_hours:
+            # If current hour is in peak hours, use current hour
+            if hour in self.peak_hours:
+                next_peak_hour_arb = hour
+            else:
+                # Find next peak hour
+                for h in sorted(self.peak_hours):
+                    if h > hour:
+                        next_peak_hour_arb = h
+                        break
+        
+        if next_peak_hour_arb is not None and 0 <= next_peak_hour_arb < 24:
+            try:
+                next_peak_price = self.day_data.iloc[next_peak_hour_arb]['price_em']
+                # Store normalized value, will denormalize when calculating arbitrage
+            except:
+                pass
+        
+        # Get previous cheap price for discharging arbitrage
+        if hasattr(self, 'cheapest_hours') and self.cheapest_hours:
+            try:
+                cheap_prices = []
+                for h in self.cheapest_hours:
+                    if h < hour and 0 <= h < 24:
+                        try:
+                            p_norm = self.day_data.iloc[h]['price_em']
+                            p = self._denormalize('price_em', p_norm)
+                            if p > 0:  # Only valid prices
+                                cheap_prices.append(p)
+                        except:
+                            continue
+                if cheap_prices:
+                    previous_cheap_price = min(cheap_prices)
+                else:
+                    # Fallback: use minimum of all past prices
+                    past_prices = []
+                    for h in range(hour):
+                        try:
+                            p_norm = self.day_data.iloc[h]['price_em']
+                            p = self._denormalize('price_em', p_norm)
+                            if p > 0:
+                                past_prices.append(p)
+                        except:
+                            continue
+                    if past_prices:
+                        previous_cheap_price = min(past_prices)
+            except:
+                pass
+        
+        # Calculate arbitrage per MWh based on action direction
+        # Note: price_em is already denormalized (used directly in revenue calculations)
+        if p_battery < -1e-3:  # Charging
+            # Arbitrage = next peak price - current price
+            if next_peak_price is not None:
+                # Denormalize next_peak_price if it's from day_data (which has normalized prices)
+                try:
+                    next_peak_price_raw = self._denormalize('price_em', next_peak_price)
+                except:
+                    next_peak_price_raw = next_peak_price  # Assume already denormalized
+                arbitrage_per_mwh = max(0.0, next_peak_price_raw - price_em)
+        elif p_battery > 1e-3:  # Discharging
+            # Arbitrage = current price - previous cheap price
+            if previous_cheap_price is not None:
+                # previous_cheap_price is already denormalized (we denormalized it above)
+                arbitrage_per_mwh = max(0.0, price_em - previous_cheap_price)
+        # else: Idling - no arbitrage
+        
+        # Calculate net profit per MWh
+        net_profit_per_mwh = arbitrage_per_mwh - degradation_per_mwh
+        
+        # Total net profit for this action (scaled to reward range)
+        # The overall reward is now normalized by 100.0, so this individual scaling is removed.
+        net_profit_scaled = (net_profit_per_mwh * energy_mwh)
+        
+        # Add net profit to reward (replaces cycle penalty)
+        reward += net_profit_scaled
 
         # NO CLIPPING: Rewards are now proportional to action magnitude
         # Small actions get small rewards, large actions get large rewards
@@ -762,7 +834,14 @@ class BESSEnv(gym.Env):
         # Small rewards/penalties (e.g., +3.0, +5.0, -3.0) remain meaningful relative to larger ones
         # Max theoretical reward: ~105.0 (full discharge at peak)
         # Max theoretical penalty: ~-25.0 (idle at peak with full SOC)
-        reward = float(reward)  # Convert to float but NO clipping - preserve all reward signals
+        reward_unnormalized = float(reward)  # Store unnormalized reward for debugging
+        
+        # === REWARD NORMALIZATION ===
+        # Normalize rewards to prevent Q-value underestimation and scale mismatch
+        # Divide by normalization factor to keep rewards in reasonable range for Q-learning
+        # This ensures Q-values can learn positive values and match episode returns
+        normalization_factor = 100.0  # Scale factor to normalize rewards
+        reward = float(reward) / normalization_factor  # Normalize rewards
 
 
     
@@ -776,10 +855,6 @@ class BESSEnv(gym.Env):
         self.episode_degradation += cost_degradation
 
         info = {
-            # CYCLE PENALTY TRACKING (first, as requested)
-            'cycle_penalty': cycle_penalty,  # Context-aware cycle penalty applied
-            'is_good_cycling': is_good_cycling,  # Whether cycling makes sense (None if idling)
-            
             'hour': hour,
             'delta': delta,
             'soc_previous': self.soc_previous,
@@ -797,14 +872,17 @@ class BESSEnv(gym.Env):
             'revenue_energy': revenue_energy,
             'revenue_reserve': revenue_reserve,
             'cost_degradation': cost_degradation,
-            'cheap_factor': cheap_factor,
-            'expensive_factor': expensive_factor,
+            'degradation_per_mwh': degradation_per_mwh,
+            'arbitrage_per_mwh': arbitrage_per_mwh,
+            'net_profit_per_mwh': net_profit_per_mwh,
+            'net_profit_scaled': net_profit_scaled,
             'delta_soc': delta_soc,
             'energy_mwh': energy_mwh,
             'peak_hour': hour in peak_hours if isinstance(peak_hours, set) else False,
             'hours_to_peak': hours_to_peak,
             'time_to_peak_hour_raw': time_to_peak_hour_raw,
             'reward': reward,
+            'reward_unnormalized': reward_unnormalized,  # Added for debugging
             'reward_shaping': reward,
             'reward_base': 0.0,
             'reward_final': reward,

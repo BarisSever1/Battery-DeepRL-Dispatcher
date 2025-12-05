@@ -250,9 +250,10 @@ class TD3Agent:
             target_q_all = rewards_expanded + (1.0 - dones_expanded) * self.config.gamma * min_q_next  # [B, T, 1]
             
             # Clip target Q-values to prevent extreme targets that can cause critic overfitting
-            # This helps stabilize training when rewards are large (e.g., up to ~105 for full discharge)
-            # Clipping range: [-1000, 1000] allows for reasonable Q-values while preventing explosions
-            target_q_all = torch.clamp(target_q_all, min=-1000.0, max=1000.0)
+            # This helps stabilize training when rewards are normalized (divided by 100.0)
+            # Clipping range: [-100, 100] allows for reasonable Q-values while preventing explosions
+            # This range accommodates normalized rewards and prevents negative bootstrapping
+            target_q_all = torch.clamp(target_q_all, min=-100.0, max=100.0)
 
         # ---- 3) Critic update: fit Q(s_{1:T}, a_{1:T}) to target_q for ALL time steps ----
         q1_current, q2_current = self.critic(states_seq, actions_for_critic)
