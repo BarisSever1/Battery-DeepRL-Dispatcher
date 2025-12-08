@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
+import pandas as pd
 import yaml
 import torch
 from gymnasium.utils import seeding
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         "--quick-eval-date",
         type=str,
         default=None,
-        help="YYYY-MM-DD date to rollout (required if --quick-eval-interval>0)",
+        help="YYYY-MM-DD date to rollout (optional, if not set will use one day per season from training data)",
     )
     parser.add_argument(
         "--quick-eval-outdir",
@@ -135,6 +136,38 @@ def close_csv(writer: Optional[CSVWriter]) -> None:
         writer.file.close()
 
 
+def get_one_date_per_season(data_path: str) -> Dict[int, str]:
+    """
+    Get one date per season from the training data.
+    
+    Returns:
+        Dictionary mapping season (0=Winter, 1=Spring, 2=Summer, 3=Fall) to date string (YYYY-MM-DD)
+    """
+    path = Path(data_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+    
+    data = pd.read_parquet(path)
+    data['date'] = data['datetime'].dt.date
+    
+    # Get season for each date (assuming season is in the data)
+    # Group by date and get the first season value for each date
+    date_seasons = data.groupby('date')['season'].first().reset_index()
+    
+    # Select one date per season
+    season_dates = {}
+    for season in [0, 1, 2, 3]:  # Winter, Spring, Summer, Fall
+        season_data = date_seasons[date_seasons['season'] == season]
+        if len(season_data) > 0:
+            # Take the first date for this season
+            selected_date = season_data.iloc[0]['date']
+            season_dates[season] = selected_date.strftime('%Y-%m-%d')
+        else:
+            print(f"Warning: No dates found for season {season}")
+    
+    return season_dates
+
+
 def _denorm_obs_features(env: BESSEnv, obs_vec: np.ndarray, soc_before: float) -> Dict[str, float]:
     """Denormalize core features for CSV output (mirrors eval script semantics)."""
     feature_names = [
@@ -182,7 +215,7 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         # 30% pure random to ensure full action space coverage
         return env.action_space.sample().astype(np.float32)
     
-    # 70% rule-based hints
+    # 70% rule-based hints matching reward shaping
     try:
         # Extract normalized features from observation
         hour_norm = obs_vec[0]  # k (hour of day)
@@ -197,19 +230,83 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         # Get peak/cheap hours from environment
         cheapest_hours = getattr(env, "cheapest_hours", set())
         peak_hours = getattr(env, "peak_hours", set())
+        soc_min = env.soc_min
+        soc_max = env.soc_max
         
-        # Rule-based hints
-        if hour in cheapest_hours and soc < 0.7:
-            # Hint: charge during cheap hours if SOC is low
-            # Use moderate to strong charging
-            action = np.random.uniform(-1.0, -0.5, size=(1,)).astype(np.float32)
-        elif hour in peak_hours and soc > 0.3:
-            # Hint: discharge during peak hours if SOC is high
-            # Use moderate to strong discharging
-            action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
+        # Check for upcoming peak hours (for between-peaks charging logic)
+        has_upcoming_peak = False
+        next_peak_hour = None
+        if peak_hours:
+            for h in sorted(peak_hours):
+                if h >= hour:
+                    next_peak_hour = h
+                    has_upcoming_peak = True
+                    break
+        
+        # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
+        if hour in peak_hours:
+            if soc <= soc_min + 0.05:
+                # At min SOC - can't discharge, but still try small action (will be clipped)
+                # This helps agent learn constraint handling
+                action = np.random.uniform(0.0, 0.2, size=(1,)).astype(np.float32)
+            elif soc > 0.3:
+                # Strong discharge during peak hours (matches reward shaping)
+                # Use moderate to strong discharging (0.5 to 1.0)
+                action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
+            else:
+                # Low SOC but not at min - moderate discharge
+                action = np.random.uniform(0.2, 0.6, size=(1,)).astype(np.float32)
+        
+        # === 2) CHEAP HOUR CHARGING ===
+        elif hour in cheapest_hours:
+            if soc >= soc_max - 0.05:
+                # At max SOC - avoid charging (will be penalized)
+                # Use small random action or idle
+                action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
+            else:
+                soc_headroom = soc_max - soc
+                if has_upcoming_peak:
+                    if soc_headroom > 0.15:
+                        # Good headroom - strong charging (matches reward shaping)
+                        action = np.random.uniform(-1.0, -0.6, size=(1,)).astype(np.float32)
+                    elif soc_headroom > 0.05:
+                        # Moderate headroom - moderate charging
+                        action = np.random.uniform(-0.8, -0.4, size=(1,)).astype(np.float32)
+                    else:
+                        # Too close to max - avoid charging (will be penalized)
+                        action = np.random.uniform(-0.2, 0.0, size=(1,)).astype(np.float32)
+                else:
+                    # After all peaks - moderate charging
+                    action = np.random.uniform(-0.7, -0.3, size=(1,)).astype(np.float32)
+        
+        # === 3) CHARGE BETWEEN PEAKS (for evening peak preparation) ===
+        elif has_upcoming_peak and soc < 0.3:
+            # Low SOC with upcoming peak - charge to prepare (matches reward shaping)
+            soc_headroom = soc_max - soc
+            if soc_headroom > 0.15:
+                # Good headroom - moderate charging
+                action = np.random.uniform(-0.8, -0.4, size=(1,)).astype(np.float32)
+            elif soc_headroom > 0.05:
+                # Moderate headroom - light charging
+                action = np.random.uniform(-0.5, -0.2, size=(1,)).astype(np.float32)
+            else:
+                # Too close to max - idle
+                action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
+        
+        # === 4) IDLING / NORMAL HOURS ===
         else:
-            # Mid-price or constraints: use random to explore
-            action = env.action_space.sample().astype(np.float32)
+            # Normal hours - smart idling or small actions
+            if soc < 0.3:
+                # Low SOC - missed opportunity, but don't force charge outside cheap hours
+                # Use small random actions
+                action = np.random.uniform(-0.3, 0.1, size=(1,)).astype(np.float32)
+            elif 0.3 < soc < 0.7:
+                # Good SOC range - smart idling (matches reward shaping)
+                # Use small actions around zero
+                action = np.random.uniform(-0.2, 0.2, size=(1,)).astype(np.float32)
+            else:
+                # High SOC - avoid charging, small discharge or idle
+                action = np.random.uniform(-0.1, 0.3, size=(1,)).astype(np.float32)
         
         return action
     except Exception:
@@ -621,21 +718,58 @@ def main() -> None:
                     # Quick 1-day rollout (optional)
                     if args.quick_eval_interval and args.quick_eval_interval > 0:
                         if episode_counter % int(args.quick_eval_interval) == 0:
-                            if not args.quick_eval_date:
-                                print("quick-eval skipped: --quick-eval-date not set")
-                            else:
-                                try:
-                                    qe_env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
-                                    rows = quick_rollout(qe_env, agent, args.quick_eval_date)
-                                    args.quick_eval_outdir.mkdir(parents=True, exist_ok=True)
-                                    out_csv = args.quick_eval_outdir / f"hourly_ep{episode_counter:04d}.csv"
-                                    with out_csv.open("w", newline="") as f:
-                                        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                            try:
+                                qe_env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
+                                
+                                # If specific date provided, use it; otherwise use one date per season
+                                if args.quick_eval_date:
+                                    eval_dates = {"single": args.quick_eval_date}
+                                    season_names = {"single": "single"}
+                                else:
+                                    eval_dates = get_one_date_per_season(args.data_path)
+                                    season_names = {0: "winter", 1: "spring", 2: "summer", 3: "fall"}
+                                
+                                args.quick_eval_outdir.mkdir(parents=True, exist_ok=True)
+                                
+                                # Create episode directory
+                                episode_dir = args.quick_eval_outdir / f"hourly_ep{episode_counter:04d}"
+                                episode_dir.mkdir(parents=True, exist_ok=True)
+                                
+                                all_rows = []
+                                
+                                for season_key, date_str in eval_dates.items():
+                                    try:
+                                        rows = quick_rollout(qe_env, agent, date_str)
+                                        
+                                        # Add season identifier to rows
+                                        season_name = season_names.get(season_key, f"season{season_key}")
+                                        for row in rows:
+                                            row['season_name'] = season_name
+                                            row['eval_date'] = date_str
+                                        
+                                        # Save individual season file
+                                        season_csv = episode_dir / f"hourly_ep{episode_counter:04d}_{season_name}.csv"
+                                        with season_csv.open("w", newline="") as f:
+                                            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                                            writer.writeheader()
+                                            writer.writerows(rows)
+                                        print(f"[quick] saved {season_csv}")
+                                        
+                                        # Collect for combined file
+                                        all_rows.extend(rows)
+                                    except Exception as e:
+                                        print(f"[quick] rollout failed for {date_str}: {e}")
+                                
+                                # Save combined file with all seasons
+                                if all_rows:
+                                    combined_csv = episode_dir / f"hourly_ep{episode_counter:04d}.csv"
+                                    with combined_csv.open("w", newline="") as f:
+                                        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
                                         writer.writeheader()
-                                        writer.writerows(rows)
-                                    print(f"[quick] saved {out_csv}")
-                                except Exception as e:
-                                    print(f"[quick] rollout failed: {e}")
+                                        writer.writerows(all_rows)
+                                    print(f"[quick] saved combined {combined_csv}")
+                            except Exception as e:
+                                print(f"[quick] evaluation setup failed: {e}")
             # Step LR schedulers at end of epoch
             if actor_scheduler is not None:
                 actor_scheduler.step()
