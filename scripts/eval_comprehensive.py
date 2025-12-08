@@ -221,6 +221,9 @@ def evaluate_td3_agent(
         # Reset environment with specific date
         obs, _ = env.reset(seed=seed, options={"date": date})
         obs_vec = np.asarray(obs, dtype=np.float32)
+        
+        # Reset agent hidden state for new episode
+        agent.reset_hidden_state()
 
         # Track metrics throughout episode
         soc_values: List[float] = []
@@ -249,14 +252,13 @@ def evaluate_td3_agent(
             obs_history.append(obs_vec)
             if len(obs_history) > EVAL_SEQ_LEN:
                 obs_history = obs_history[-EVAL_SEQ_LEN:]
-            seq_len = EVAL_SEQ_LEN
-            seq = np.zeros((1, seq_len, obs_vec.shape[-1]), dtype=np.float32)
-            seq[0, -len(obs_history):, :] = np.asarray(obs_history, dtype=np.float32)
+            # Use actual history length (no zero-padding) to match quick eval behavior
+            state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
             # Hidden state is already reset at episode start, no need to reset again
             try:
-                action_vec = agent.act(seq, eval_mode=True, reset_hidden=False)[0]
+                action_vec = agent.act(state_seq, eval_mode=True, reset_hidden=False)[0]
             except Exception:
-                seq_t = np.transpose(seq, (1, 0, 2))
+                seq_t = np.transpose(state_seq, (1, 0, 2))
                 action_vec = agent.act(seq_t, eval_mode=True, reset_hidden=False)[0]
             if isinstance(action_vec, torch.Tensor):
                 action_array = action_vec.detach().cpu().numpy().astype(np.float32)
