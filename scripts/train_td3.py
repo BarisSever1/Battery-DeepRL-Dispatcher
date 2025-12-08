@@ -226,6 +226,8 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
     obs_history: List[_np.ndarray] = []
     done = False
     step = 0
+    # Reset hidden state at episode start
+    agent.reset_hidden_state()
     totals = {"revenue_pv": 0.0, "revenue_energy": 0.0, "revenue_reserve": 0.0, "degradation": 0.0}
 
     history_len = 24
@@ -235,7 +237,8 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
         if len(obs_history) > history_len:
             obs_history.pop(0)
         state_seq = _np.asarray(obs_history, dtype=_np.float32)[ _np.newaxis, :, :]  # [1,T,F]
-        action_vec = agent.act(state_seq, eval_mode=True)[0]
+        # Hidden state is already reset at episode start, no need to reset again
+        action_vec = agent.act(state_seq, eval_mode=True, reset_hidden=False)[0]
         action_arr = _np.asarray(action_vec, dtype=_np.float32)
 
         q1_value = float("nan")
@@ -468,6 +471,8 @@ def main() -> None:
                 step = 0
                 # Maintain full observation history within the episode
                 obs_history: List[np.ndarray] = []
+                # Reset hidden state at episode start
+                agent.reset_hidden_state()
                 while not done:
                     step += 1
                     # RL clean-up patch: append and truncate to last seq_len steps
@@ -497,9 +502,11 @@ def main() -> None:
                         
                         # Policy action with Gaussian noise (noise added in agent.act)
                         state_seq = np.asarray(obs_history, dtype=np.float32)[np.newaxis, :, :]  # [1, T, F]
+                        # Hidden state is already reset at episode start, no need to reset again
                         action_vec = agent.act(
                             state_seq,
                             eval_mode=args.eval_mode,
+                            reset_hidden=False,
                         )[0]
                         action = np.asarray(action_vec, dtype=np.float32)
 

@@ -12,7 +12,7 @@ state-action pairs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -35,9 +35,11 @@ class LSTMOutput:
     """
     Small helper class to bundle what an LSTM block returns:
       * outputs: the sequence of outputs for every time step.
+      * hidden: the hidden state tuple (h_n, c_n) for maintaining state across sequences.
     """
 
     outputs: Tensor
+    hidden: Tuple[Tensor, Tensor] = None
 
 
 class ActorLSTM(nn.Module):
@@ -79,18 +81,31 @@ class ActorLSTM(nn.Module):
     def forward(
         self,
         state_seq: Tensor,
-    ) -> Tensor:
+        hidden: Optional[Tuple[Tensor, Tensor]] = None,
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Forward pass through the actor network.
+        
+        Args:
+            state_seq: State sequence of shape [batch, time, features]
+            hidden: Optional hidden state tuple (h_n, c_n) from previous forward pass.
+                   If None, hidden state is initialized to zeros.
+        
+        Returns:
+            actions: Action sequence of shape [batch, time, 1]
+            hidden: Hidden state tuple (h_n, c_n) for maintaining state across sequences
+        """
         if state_seq.dim() != 3:
             raise ValueError("state_seq must have shape [batch, time, features]")
 
-        # Run the whole sequence through the LSTM (hidden state initialized to None internally)
-        lstm_out, _ = self.lstm(state_seq, None)
+        # Run the sequence through the LSTM with optional hidden state
+        lstm_out, hidden_out = self.lstm(state_seq, hidden)
         # Apply MLP to each time step
         features = self.backbone(lstm_out)
         # Map to a single action value per time step, then squash to [-1, 1]
         raw_action = self.head(features)
         actions = torch.tanh(raw_action)  # shape [B,T,1], range [-1, 1]
-        return actions
+        return actions, hidden_out
 
 
 class _CriticHead(nn.Module):
@@ -123,16 +138,28 @@ class _CriticHead(nn.Module):
     def forward(
         self,
         x: Tensor,
+        hidden: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> LSTMOutput:
+        """
+        Forward pass through the critic head.
+        
+        Args:
+            x: Input sequence of shape [batch, time, features]
+            hidden: Optional hidden state tuple (h_n, c_n) from previous forward pass.
+                   If None, hidden state is initialized to zeros.
+        
+        Returns:
+            LSTMOutput with outputs and hidden state
+        """
         if x.dim() != 3:
             raise ValueError("Input must have shape [batch, time, features]")
 
-        # Encode the whole sequence, then push through the MLP (hidden state initialized to None internally)
-        lstm_out, _ = self.lstm(x, None)
+        # Encode the sequence with optional hidden state
+        lstm_out, hidden_out = self.lstm(x, hidden)
         features = self.backbone(lstm_out)
         # Return Q-values for ALL time steps (shape [B,T,1]) for sequence returns
         q_values = self.head(features)  # [B, T, 1]
-        return LSTMOutput(outputs=q_values)
+        return LSTMOutput(outputs=q_values, hidden=hidden_out)
 
 
 class CriticLSTM(nn.Module):
@@ -172,7 +199,20 @@ class CriticLSTM(nn.Module):
         self,
         state_seq: Tensor,
         action_seq: Tensor,
+        hidden: Optional[Tuple[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor]]] = None,
     ) -> Tuple[LSTMOutput, LSTMOutput]:
+        """
+        Forward pass through the twin critics.
+        
+        Args:
+            state_seq: State sequence of shape [batch, time, state_features]
+            action_seq: Action sequence of shape [batch, time, action_features] or [batch, 1, action_features]
+            hidden: Optional tuple of hidden states (q1_hidden, q2_hidden) from previous forward pass.
+                   Each is a tuple (h_n, c_n). If None, hidden states are initialized to zeros.
+        
+        Returns:
+            Tuple of (q1_output, q2_output) where each is an LSTMOutput with outputs and hidden state
+        """
         # Expect [B,T,F] for states and [B,T,A] (or [B,1,A]) for actions.
         if state_seq.dim() != 3:
             raise ValueError("state_seq must have shape [batch, time, state_features]")
@@ -196,8 +236,13 @@ class CriticLSTM(nn.Module):
             raise ValueError(f"Time dimension mismatch: states T={T_s}, actions T={T_a}")
 
         critic_input = torch.cat([state_seq, action_seq], dim=-1)  # [B,T,F+A]
-        q1 = self.q1(critic_input)
-        q2 = self.q2(critic_input)
+        
+        # Extract hidden states for q1 and q2
+        q1_hidden = hidden[0] if hidden is not None else None
+        q2_hidden = hidden[1] if hidden is not None else None
+        
+        q1 = self.q1(critic_input, q1_hidden)
+        q2 = self.q2(critic_input, q2_hidden)
         return q1, q2
 
 

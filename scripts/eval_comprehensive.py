@@ -252,11 +252,12 @@ def evaluate_td3_agent(
             seq_len = EVAL_SEQ_LEN
             seq = np.zeros((1, seq_len, obs_vec.shape[-1]), dtype=np.float32)
             seq[0, -len(obs_history):, :] = np.asarray(obs_history, dtype=np.float32)
+            # Hidden state is already reset at episode start, no need to reset again
             try:
-                action_vec = agent.act(seq, eval_mode=True)[0]
+                action_vec = agent.act(seq, eval_mode=True, reset_hidden=False)[0]
             except Exception:
                 seq_t = np.transpose(seq, (1, 0, 2))
-                action_vec = agent.act(seq_t, eval_mode=True)[0]
+                action_vec = agent.act(seq_t, eval_mode=True, reset_hidden=False)[0]
             if isinstance(action_vec, torch.Tensor):
                 action_array = action_vec.detach().cpu().numpy().astype(np.float32)
             else:

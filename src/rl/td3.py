@@ -12,7 +12,7 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 
 from .buffer import ReplayBuffer
-from .models import ActorLSTM, CriticLSTM
+from .models import ActorLSTM, CriticLSTM, LSTMOutput
 
 
 @dataclass
@@ -99,15 +99,24 @@ class TD3Agent:
 
         # Counts how many gradient steps we took (used for delayed policy updates)
         self.total_it = 0
+        
+        # Hidden state management for LSTM
+        # These are maintained across steps within an episode and reset at episode boundaries
+        self.actor_hidden: Optional[Tuple[Tensor, Tensor]] = None
 
     # ------------------------------------------------------------------
     # Acting
     # ------------------------------------------------------------------
+    
+    def reset_hidden_state(self) -> None:
+        """Reset hidden states for a new episode."""
+        self.actor_hidden = None
 
     def act(
         self,
         state_seq: np.ndarray,
         eval_mode: bool = False,
+        reset_hidden: bool = False,
     ) -> np.ndarray:
         """
         Compute an action from a sequence of states.
@@ -115,17 +124,23 @@ class TD3Agent:
         Args:
             state_seq: numpy array of shape [batch, time, features]. In practice
                        we pass batch=1 and the last N observations as history.
+                       For hidden state management, can also pass [1, 1, features] for single-step.
             eval_mode: if True → no exploration noise is added (pure policy).
+            reset_hidden: if True → reset hidden state (e.g., at episode start).
 
         Returns:
             numpy array of shape [batch, action_dim] with values in [action_low, action_high].
         """
+        # Reset hidden state if requested
+        if reset_hidden:
+            self.actor_hidden = None
+        
         # Put the actor into evaluation mode and disable gradients (no training here)
         self.actor.eval()
         with torch.no_grad():
             state_tensor = torch.as_tensor(state_seq, dtype=torch.float32, device=self.device)
-            # ActorLSTM returns an action for every time step in the sequence
-            action_seq = self.actor(state_tensor)
+            # ActorLSTM returns (actions, hidden_state)
+            action_seq, self.actor_hidden = self.actor(state_tensor, self.actor_hidden)
 
             if action_seq.dim() == 2:  # [B,A] -> [B,1,A]
                 action_seq = action_seq.unsqueeze(1)
@@ -206,9 +221,8 @@ class TD3Agent:
 
         # ---- 2) Compute target Q values for ALL time steps (no gradients) ----
         with torch.no_grad():
-            # Get next actions for all next states in the sequence
-            # next_states_seq[:, t, :] is the next state after states_seq[:, t, :]
-            next_actions_full = self.actor_target(next_states_seq)
+            # Vectorized next-action generation (hidden reset per sequence by passing None)
+            next_actions_full, _ = self.actor_target(next_states_seq, None)
             if next_actions_full.dim() == 2:
                 next_actions_full = next_actions_full.unsqueeze(1)
 
@@ -237,7 +251,7 @@ class TD3Agent:
                     next_actions_seq[:, :-1, :] + early_noise
                 ).clamp(self.config.action_low, self.config.action_high)
 
-            # Compute Q-values for next states (all time steps)
+            # Compute Q-values for next states (vectorized over batch/time)
             q1_next, q2_next = self.critic_target(next_states_seq, next_actions_seq)
             # Clipped double‑Q: take the smaller of the two target critics for all time steps
             min_q_next = torch.min(q1_next.outputs, q2_next.outputs)  # [B, T, 1]
@@ -275,12 +289,13 @@ class TD3Agent:
         actor_loss = torch.zeros(1, device=self.device)
         if self.total_it % self.config.policy_delay == 0:
             # ---- 4) Actor update: improve policy a = π(s_{1:T}) ----
-            # For sequence returns: maximize Q-values for ALL time steps in the sequence
-            actor_actions_full = self.actor(states_seq)
+            # Vectorized actor actions over the whole sequence
+            actor_actions_full, _ = self.actor(states_seq, None)
             if actor_actions_full.dim() == 2:
                 actor_actions_full = actor_actions_full.unsqueeze(1)
-            # Use the full policy-generated action sequence
             actor_actions_seq = actor_actions_full
+
+            # Compute Q-values for actor actions (vectorized)
             q1_actor, q2_actor = self.critic(states_seq, actor_actions_seq)
             # Use min(Q1, Q2) for actor update (TD3 standard: clipped double-Q for actor)
             # This prevents overestimation bias and makes the actor more conservative
