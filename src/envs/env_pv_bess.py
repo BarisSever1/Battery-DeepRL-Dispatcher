@@ -744,7 +744,7 @@ class BESSEnv(gym.Env):
                 reward += -5.0
             else:
                 # Idling at other times - reward (similar to discharge/charge base)
-                reward += 10.0
+                reward += 50.0
 
         # NO CLIPPING: Rewards are now proportional to action magnitude
         # Small actions get small rewards, large actions get large rewards

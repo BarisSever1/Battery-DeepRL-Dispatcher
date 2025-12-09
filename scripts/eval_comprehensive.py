@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.baselines.policies import (
-    pv_da_plan,
+    pv_da_two_cycles_plan,
     pv_ds3_plan,
 )
 from src.envs import BESSEnv
@@ -802,7 +802,7 @@ def main() -> None:
     # Baselines
     baselines = [
         ("PV+DS3 (Reserve Only)", pv_ds3_plan),
-        ("PV+DA (Heuristic)", pv_da_plan),
+        ("PV+DA (Two Cycles)", pv_da_two_cycles_plan),
     ]
 
     for name, plan_fn in baselines:

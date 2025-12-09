@@ -80,9 +80,16 @@ def pv_ds3_plan(env: BESSEnv, seed: int) -> List[float]:
     return [0.0] * env.max_hours
 
 
-def pv_da_plan(env: BESSEnv, seed: int) -> List[float]:
-    """Light heuristic: small discharge at peaks, modest charging beforehand."""
-
+def pv_da_two_cycles_plan(env: BESSEnv, seed: int) -> List[float]:
+    """
+    Two full cycles baseline:
+    1. Start at 0.5 SOC
+    2. Charge fully in cheapest hours before morning peak
+    3. Discharge fully during morning peak window (peak-1 to peak+1)
+    4. Charge before evening peak in cheap hours
+    5. Discharge fully during evening peak window (peak-1 to peak+1)
+    6. Charge back to 0.5 by end of day
+    """
     del seed
     day_data = env.day_data.reset_index(drop=True)
     plan = [0.0] * env.max_hours
@@ -100,22 +107,59 @@ def pv_da_plan(env: BESSEnv, seed: int) -> List[float]:
     morning_peak = _clip_hour(morning_peak)
     evening_peak = _clip_hour(evening_peak)
 
-    for peak in sorted({morning_peak, evening_peak}):
-        plan[peak] = 0.95  # Discharge at peak hours (positive)
-        window = [h for h in range(max(0, peak - 6), peak) if plan[h] == 0.0]
-        if window:
-            buy_hour = min(window, key=lambda h: prices[h])
-            plan[buy_hour] = -0.9  # Charge before peak hours (negative)
+    # Find cheapest hours before morning peak (hours 0 to morning_peak-1)
+    hours_before_morning = list(range(0, morning_peak))
+    cheapest_before_morning = []
+    if hours_before_morning:
+        prices_before_morning = [(h, prices[h]) for h in hours_before_morning]
+        prices_before_morning.sort(key=lambda x: x[1])  # Sort by price
+        # Take 3 cheapest hours before morning peak
+        cheapest_before_morning = [h for h, _ in prices_before_morning[:3]]
+
+    # Find cheapest hours before evening peak (between morning and evening peak)
+    hours_before_evening = list(range(morning_peak + 1, evening_peak))
+    cheapest_before_evening = []
+    if hours_before_evening:
+        prices_before_evening = [(h, prices[h]) for h in hours_before_evening]
+        prices_before_evening.sort(key=lambda x: x[1])  # Sort by price
+        # Take 3 cheapest hours before evening peak
+        cheapest_before_evening = [h for h, _ in prices_before_evening[:3]]
+
+    # Phase 1: Charge fully in cheapest hours before morning peak
+    for h in cheapest_before_morning:
+        plan[h] = -1.0  # Full charge
+
+    # Phase 2: Discharge fully during morning peak window (peak-1 to peak+1)
+    morning_peak_window = [
+        h for h in range(max(0, morning_peak - 1), min(env.max_hours, morning_peak + 2))
+        if h not in cheapest_before_morning  # Don't discharge in hours we're charging
+    ]
+    for h in morning_peak_window:
+        plan[h] = 1.0  # Full discharge
+
+    # Phase 3: Charge in cheapest hours before evening peak
+    for h in cheapest_before_evening:
+        plan[h] = -1.0  # Full charge
+
+    # Phase 4: Discharge fully during evening peak window (peak-1 to peak+1)
+    evening_peak_window = [
+        h for h in range(max(0, evening_peak - 1), min(env.max_hours, evening_peak + 2))
+        if h not in cheapest_before_evening  # Don't discharge in hours we're charging
+    ]
+    for h in evening_peak_window:
+        plan[h] = 1.0  # Full discharge
+
+    # Phase 5: Charge back to 0.5 from evening peak to end of day
+    # Calculate how much we need to charge back (from ~0.1 to 0.5 = 0.4 of capacity)
+    # With efficiency, we need to charge more: 0.4 / eta_ch
+    # But we'll just charge at moderate rate for remaining hours
+    for h in range(evening_peak + 1, env.max_hours):
+        # Charge moderately to reach 0.5 by end of day
+        # If we have ~6 hours left and need to go from 0.1 to 0.5, charge at ~0.4/6 = 0.067 per hour
+        # But with efficiency losses, we need more, so use -0.5 (half charge rate)
+        plan[h] = -0.5  # Moderate charge to reach 0.5
 
     return plan
-
-
-def pv_da_full_plan(env: BESSEnv, seed: int) -> List[float]:
-    """Aggressive paper-style arbitrage: alternating charge/discharge pattern."""
-
-    del seed
-    # Alternate between charging and discharging (not practical but for testing)
-    return [1.0 if h % 2 == 0 else -1.0 for h in range(env.max_hours)]
 
 
 def evaluate_policy(env: BESSEnv, name: str, plan_fn, seeds: List[int]) -> Dict[str, float]:
@@ -148,8 +192,7 @@ __all__ = [
     "EpisodeStats",
     "evaluate_policy",
     "pv_ds3_plan",
-    "pv_da_plan",
-    "pv_da_full_plan",
+    "pv_da_two_cycles_plan",
 ]
 
 
