@@ -765,6 +765,8 @@ def main() -> None:
     action_dim = int(env.action_space.shape[0])
 
     # Initialize and load TD3 agent
+    # Note: For evaluation, we only need action bounds. Other config values (n_step, gamma, etc.)
+    # use defaults from TD3Config, which is fine since evaluation doesn't train or use replay buffer.
     resolved_actor = _resolve_latest_actor(args.actor_checkpoint)
     print(f"\nLoading TD3 agent from: {resolved_actor}")
     config = TD3Config(

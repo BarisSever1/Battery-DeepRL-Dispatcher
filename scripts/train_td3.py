@@ -150,20 +150,35 @@ def get_one_date_per_season(data_path: str) -> Dict[int, str]:
     data = pd.read_parquet(path)
     data['date'] = data['datetime'].dt.date
     
-    # Get season for each date (assuming season is in the data)
+    # Denormalize season values if they are normalized (in [-1, 1] range)
+    # Normalization formula: normalized = 2 * (value - min) / (max - min) - 1
+    # For season: min=0, max=3, so: normalized = 2 * value / 3 - 1
+    # Inverse: value = (normalized + 1) * 3 / 2
+    # Round to nearest integer to get season (0, 1, 2, 3)
+    if data['season'].min() >= -1.1 and data['season'].max() <= 1.1:
+        # Values are normalized, denormalize them
+        data['season_raw'] = ((data['season'] + 1.0) * 3.0 / 2.0).round().astype(int)
+        # Clip to valid range [0, 3]
+        data['season_raw'] = data['season_raw'].clip(0, 3)
+    else:
+        # Values are already raw integers
+        data['season_raw'] = data['season'].astype(int)
+    
+    # Get season for each date (using denormalized season)
     # Group by date and get the first season value for each date
-    date_seasons = data.groupby('date')['season'].first().reset_index()
+    date_seasons = data.groupby('date')['season_raw'].first().reset_index()
     
     # Select one date per season
     season_dates = {}
     for season in [0, 1, 2, 3]:  # Winter, Spring, Summer, Fall
-        season_data = date_seasons[date_seasons['season'] == season]
+        season_data = date_seasons[date_seasons['season_raw'] == season]
         if len(season_data) > 0:
             # Take the first date for this season
             selected_date = season_data.iloc[0]['date']
             season_dates[season] = selected_date.strftime('%Y-%m-%d')
+            print(f"Selected {['Winter', 'Spring', 'Summer', 'Fall'][season]} date: {season_dates[season]}")
         else:
-            print(f"Warning: No dates found for season {season}")
+            print(f"Warning: No dates found for season {season} ({['Winter', 'Spring', 'Summer', 'Fall'][season]})")
     
     return season_dates
 
@@ -205,7 +220,7 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
     
     Args:
         env: The BESS environment
-        obs_vec: Normalized observation vector (18-dim)
+        obs_vec: Normalized observation vector (20-dim)
         random_prob: Probability of using pure random action (default 0.3)
     
     Returns:
@@ -227,86 +242,42 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         soc = env._denormalize("soc", soc_norm)
         soc = max(0.0, min(1.0, soc))  # Clamp to valid range
         
-        # Get peak/cheap hours from environment
-        cheapest_hours = getattr(env, "cheapest_hours", set())
-        peak_hours = getattr(env, "peak_hours", set())
+        # Get peak hours and cheapest hours before peaks from environment
+        morning_peak_hours = getattr(env, "morning_peak_hours", set())
+        evening_peak_hours = getattr(env, "evening_peak_hours", set())
+        peak_hours = morning_peak_hours.union(evening_peak_hours)
+        cheapest_before_morning = getattr(env, "cheapest_before_morning", set())
+        cheapest_before_evening = getattr(env, "cheapest_before_evening", set())
         soc_min = env.soc_min
         soc_max = env.soc_max
         
-        # Check for upcoming peak hours (for between-peaks charging logic)
-        has_upcoming_peak = False
-        next_peak_hour = None
-        if peak_hours:
-            for h in sorted(peak_hours):
-                if h >= hour:
-                    next_peak_hour = h
-                    has_upcoming_peak = True
-                    break
-        
         # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
+        # Discharge in morning peak or evening peak
         if hour in peak_hours:
             if soc <= soc_min + 0.05:
-                # At min SOC - can't discharge, but still try small action (will be clipped)
-                # This helps agent learn constraint handling
-                action = np.random.uniform(0.0, 0.2, size=(1,)).astype(np.float32)
+                # At min SOC - can't discharge, small action (will be clipped)
+                action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
             elif soc > 0.3:
                 # Strong discharge during peak hours (matches reward shaping)
-                # Use moderate to strong discharging (0.5 to 1.0)
                 action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
             else:
                 # Low SOC but not at min - moderate discharge
                 action = np.random.uniform(0.2, 0.6, size=(1,)).astype(np.float32)
         
-        # === 2) CHEAP HOUR CHARGING ===
-        elif hour in cheapest_hours:
+        # === 2) CHARGE IN CHEAPEST HOURS BEFORE PEAKS ===
+        # Charge in 3 cheapest hours before morning peak or before evening peak
+        elif hour in cheapest_before_morning or hour in cheapest_before_evening:
             if soc >= soc_max - 0.05:
                 # At max SOC - avoid charging (will be penalized)
-                # Use small random action or idle
                 action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
             else:
-                soc_headroom = soc_max - soc
-                if has_upcoming_peak:
-                    if soc_headroom > 0.15:
-                        # Good headroom - strong charging (matches reward shaping)
-                        action = np.random.uniform(-1.0, -0.6, size=(1,)).astype(np.float32)
-                    elif soc_headroom > 0.05:
-                        # Moderate headroom - moderate charging
-                        action = np.random.uniform(-0.8, -0.4, size=(1,)).astype(np.float32)
-                    else:
-                        # Too close to max - avoid charging (will be penalized)
-                        action = np.random.uniform(-0.2, 0.0, size=(1,)).astype(np.float32)
-                else:
-                    # After all peaks - moderate charging
-                    action = np.random.uniform(-0.7, -0.3, size=(1,)).astype(np.float32)
+                # Strong charging in cheapest hours before peaks (matches reward shaping)
+                action = np.random.uniform(-1.0, -0.6, size=(1,)).astype(np.float32)
         
-        # === 3) CHARGE BETWEEN PEAKS (for evening peak preparation) ===
-        elif has_upcoming_peak and soc < 0.3:
-            # Low SOC with upcoming peak - charge to prepare (matches reward shaping)
-            soc_headroom = soc_max - soc
-            if soc_headroom > 0.15:
-                # Good headroom - moderate charging
-                action = np.random.uniform(-0.8, -0.4, size=(1,)).astype(np.float32)
-            elif soc_headroom > 0.05:
-                # Moderate headroom - light charging
-                action = np.random.uniform(-0.5, -0.2, size=(1,)).astype(np.float32)
-            else:
-                # Too close to max - idle
-                action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
-        
-        # === 4) IDLING / NORMAL HOURS ===
+        # === 3) IDLING / OTHER HOURS ===
         else:
-            # Normal hours - smart idling or small actions
-            if soc < 0.3:
-                # Low SOC - missed opportunity, but don't force charge outside cheap hours
-                # Use small random actions
-                action = np.random.uniform(-0.3, 0.1, size=(1,)).astype(np.float32)
-            elif 0.3 < soc < 0.7:
-                # Good SOC range - smart idling (matches reward shaping)
-                # Use small actions around zero
-                action = np.random.uniform(-0.2, 0.2, size=(1,)).astype(np.float32)
-            else:
-                # High SOC - avoid charging, small discharge or idle
-                action = np.random.uniform(-0.1, 0.3, size=(1,)).astype(np.float32)
+            # Other hours - idle (matches reward shaping: neutral/idle reward)
+            action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
         
         return action
     except Exception:
@@ -450,6 +421,7 @@ def main() -> None:
 
     # Allow YAML to override core algorithm knobs when present
     gamma_val = float(algo_cfg.get("gamma", args.gamma)) if algo_cfg else args.gamma
+    n_step_val = int(algo_cfg.get("n_step", 1)) if algo_cfg else 1  # Default to 6 for n-step learning
     tau_val = float(algo_cfg.get("tau", args.tau)) if algo_cfg else args.tau
     actor_lr_val = float(algo_cfg.get("actor_lr", args.actor_lr if args.actor_lr is not None else args.lr))
     critic_lr_val = float(algo_cfg.get("critic_lr", args.critic_lr if args.critic_lr is not None else args.lr))
@@ -460,6 +432,7 @@ def main() -> None:
 
     config = TD3Config(
         gamma=gamma_val,
+        n_step=n_step_val,  # N-step return horizon
         tau=tau_val,
         policy_delay=args.policy_delay,
         lr=args.lr,

@@ -52,7 +52,7 @@ class ReplayBuffer:
         action_dim: int,
         capacity: int = 200_000,
         dtype: np.dtype = np.float32,
-        n_step: int = 6,
+        n_step: int = 1,
         gamma: float = 0.995,
     ) -> None:
         if capacity <= 0:

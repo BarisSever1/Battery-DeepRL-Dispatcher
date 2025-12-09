@@ -31,12 +31,13 @@ class BESSEnv(gym.Env):
       * The environment enforces all electrical and SOC constraints and
         computes revenue + degradation costs + shaping bonuses/penalties.
     
-    State: 18-dimensional vector (normalized to [-1, 1])
+    State: 20-dimensional vector (normalized to [-1, 1])
         - Temporal: k, weekday, season
         - Prices: price_em, price_as
         - Operations: p_res_total, soc, dod
         - Daily context: morning/evening max prices, argmax, min price, argmin, reserve min/max
         - Planning aids: time_to_peak_hour, prior-step SOC (to expose delta SOC directly)
+        - Explicit indicators: is_peak_hour, is_cheap_before_peak (binary: 1.0 = yes, -1.0 = no)
     
     Action: Continuous value δ ∈ [-1, 1]
         - δ < 0: Charge (magnitude scales charging power)
@@ -96,11 +97,12 @@ class BESSEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Observation: 18-dimensional state vector (normalized)
+        # Observation: 20-dimensional state vector (normalized)
+        # Added explicit binary indicators for peak/cheap hours to help agent learn
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(18,),
+            shape=(20,),
             dtype=np.float32
         )
         
@@ -299,21 +301,75 @@ class BESSEnv(gym.Env):
                 self.k_morn = -1
                 self.k_even = -1
 
-        # Recompute cheapest hours for the selected day (for shaping/diagnostics)
+        # Compute cheapest hours before each peak for reward shaping
+        # Find 3 cheapest hours before morning peak and 3 cheapest hours before evening peak
         try:
             if self._day_prices_raw is not None and len(self._day_prices_raw) >= 2:
                 prices_arr = np.asarray(self._day_prices_raw, dtype=float)
+                
+                # Find 3 cheapest hours before morning peak (hours 0 to k_morn-1)
+                morning_peak_hour = getattr(self, 'k_morn', 8)
+                if morning_peak_hour > 0:
+                    hours_before_morning = list(range(0, morning_peak_hour))
+                    if len(hours_before_morning) > 0:
+                        prices_before_morning = [(h, prices_arr[h]) for h in hours_before_morning]
+                        prices_before_morning.sort(key=lambda x: x[1])  # Sort by price
+                        self.cheapest_before_morning = {h for h, _ in prices_before_morning[:3]}
+                        # Track window price range for cheapness scaling
+                        self.morning_price_min = float(np.min([p for _, p in prices_before_morning]))
+                        self.morning_price_max = float(np.max([p for _, p in prices_before_morning]))
+                    else:
+                        self.cheapest_before_morning = set()
+                        self.morning_price_min = float('inf')
+                        self.morning_price_max = float('-inf')
+                else:
+                    self.cheapest_before_morning = set()
+                    self.morning_price_min = float('inf')
+                    self.morning_price_max = float('-inf')
+                
+                # Find 3 cheapest hours before evening peak (hours after morning peak to k_even-1)
+                evening_peak_hour = getattr(self, 'k_even', 16)
+                hours_before_evening = list(range(morning_peak_hour + 1, evening_peak_hour))
+                if len(hours_before_evening) > 0:
+                    prices_before_evening = [(h, prices_arr[h]) for h in hours_before_evening]
+                    prices_before_evening.sort(key=lambda x: x[1])  # Sort by price
+                    self.cheapest_before_evening = {h for h, _ in prices_before_evening[:3]}
+                    self.evening_price_min = float(np.min([p for _, p in prices_before_evening]))
+                    self.evening_price_max = float(np.max([p for _, p in prices_before_evening]))
+                else:
+                    self.cheapest_before_evening = set()
+                    self.evening_price_min = float('inf')
+                    self.evening_price_max = float('-inf')
+                
+                # Keep cheapest_hours for backward compatibility (all cheapest hours)
                 cheap_threshold = float(np.nanquantile(prices_arr, 0.30))
                 self.cheapest_hours = {int(idx) for idx, p in enumerate(prices_arr) if p <= cheap_threshold}
                 if len(self.cheapest_hours) < 4:
                     price_sorted_asc = np.argsort(prices_arr)
                     self.cheapest_hours = set(int(h) for h in price_sorted_asc[:4])
             else:
+                self.cheapest_before_morning = set()
+                self.cheapest_before_evening = set()
                 self.cheapest_hours = set()
+                self.morning_price_min = float('inf')
+                self.morning_price_max = float('-inf')
+                self.evening_price_min = float('inf')
+                self.evening_price_max = float('-inf')
         except Exception:
+            self.cheapest_before_morning = set()
+            self.cheapest_before_evening = set()
             self.cheapest_hours = set()
+            self.morning_price_min = float('inf')
+            self.morning_price_max = float('-inf')
+            self.evening_price_min = float('inf')
+            self.evening_price_max = float('-inf')
         if len(self.cheapest_hours) == 0:
             self.cheapest_hours = {0, 1, 2, 3}
+            # Fallback window ranges
+            self.morning_price_min = float('inf')
+            self.morning_price_max = float('-inf')
+            self.evening_price_min = float('inf')
+            self.evening_price_max = float('-inf')
         self._day_pv_raw = None
 
         # Build peak discharge windows (±1 hour around detected maxima)
@@ -369,7 +425,7 @@ class BESSEnv(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Build the current observation (18-dimensional normalized vector).
+        Build the current observation (20-dimensional normalized vector).
         
         We take the raw feature row for the current hour, replace SOC / DOD
         with the environment's internal values, and append a few extra
@@ -413,6 +469,17 @@ class BESSEnv(gym.Env):
         t2p_norm = 2.0 * ((time_to_next_peak_hour - t2p_min) / t2p_range) - 1.0
         t2p_norm = float(np.clip(t2p_norm, -1.0, 1.0))
 
+        # Compute explicit binary indicators for reward shaping
+        # These help the agent directly identify when to act
+        hour = self.current_hour
+        morning_peak_hours = getattr(self, 'morning_peak_hours', set())
+        evening_peak_hours = getattr(self, 'evening_peak_hours', set())
+        is_peak_hour = 1.0 if (hour in morning_peak_hours or hour in evening_peak_hours) else -1.0
+        
+        cheapest_before_morning = getattr(self, 'cheapest_before_morning', set())
+        cheapest_before_evening = getattr(self, 'cheapest_before_evening', set())
+        is_cheap_before_peak = 1.0 if (hour in cheapest_before_morning or hour in cheapest_before_evening) else -1.0
+        
         # Get normalized features from data (already normalized)
         obs = np.array([
             hour_data['k'],                    # 1. Hour of day
@@ -433,6 +500,8 @@ class BESSEnv(gym.Env):
             hour_data['price_as_max'],         # 16. Daily reserve max
             t2p_norm,                          # 17. Normalized time to next peak
             self._normalize_soc(self.soc_previous),  # 18. SOC before action (gives delta context)
+            is_peak_hour,                      # 19. Binary: is current hour a peak hour? (1.0 = yes, -1.0 = no)
+            is_cheap_before_peak,              # 20. Binary: is current hour cheap before peak? (1.0 = yes, -1.0 = no)
         ], dtype=np.float32)
 
         self._latest_obs_future_features = {
@@ -596,242 +665,94 @@ class BESSEnv(gym.Env):
             hours_to_peak = int(max(0, next_peak_hour - hour))
         peak_hours = getattr(self, "peak_hours", set())
 
-        # === OPTIMIZED REWARD SHAPING ===
-        # Designed to break local optimum and avoid underestimation bias
-        # Target: Q-values in range 5-15 for good actions, strong penalties for bad actions
+        # === SIMPLE REWARD SHAPING ===
+        # Basic two-cycle strategy:
+        # 1. Charge in 3 cheapest hours before morning peak
+        # 2. Discharge in morning peak
+        # 3. Charge in 3 cheapest hours before evening peak
+        # 4. Discharge in evening peak
         reward = 0.0
         
-        # Get next upcoming peak hour for timing checks
-        # This handles both morning and evening peaks correctly
-        next_peak_hour_shaping = None
-        if self.peak_hours:
-            for h in sorted(self.peak_hours):
-                if h >= hour:
-                    next_peak_hour_shaping = h
-                    break
-        # If no peak hour found, we're past all peaks (use 24 as sentinel)
-        has_upcoming_peak = next_peak_hour_shaping is not None
+        # Get peak hours and cheapest hours before peaks
+        morning_peak_hours = getattr(self, 'morning_peak_hours', set())
+        evening_peak_hours = getattr(self, 'evening_peak_hours', set())
+        is_morning_peak = hour in morning_peak_hours
+        is_evening_peak = hour in evening_peak_hours
+        is_any_peak = is_morning_peak or is_evening_peak
         
-        # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
-        # This is the main profit opportunity - reward it very strongly
-        # SCALED DOWN: Removed clipping, so rewards are proportional to energy
-        # Small actions get small rewards, large actions get large rewards
-        if p_battery > 1e-3:  # Discharging
-            # First check: if already at min SOC, penalize immediately (no rewards)
-            if self.soc <= self.soc_min + 0.05:
-                reward += -15.0  # Strong penalty for trying to discharge at min SOC
-            elif hour in self.peak_hours:
-                # Strong base reward + energy-scaled bonus (scaled down for no clipping)
-                base_peak_reward = 5.0  # Base reward for attempting peak discharge (reduced from 15.0)
-                energy_bonus = expensive_factor * energy_mwh * 5.0  # 5.0 per MWh (reduced from 20.0)
-                # Max theoretical: 5.0 + 1.0 * 20 * 5.0 = 105.0 for full discharge
-                reward += base_peak_reward + energy_bonus
-            else:
-                # Discharging outside peak = missed opportunity
-                reward += -5.0  # Strong penalty for misaligned discharge
+        cheapest_before_morning = getattr(self, 'cheapest_before_morning', set())
+        cheapest_before_evening = getattr(self, 'cheapest_before_evening', set())
+        is_cheap_before_morning = hour in cheapest_before_morning
+        is_cheap_before_evening = hour in cheapest_before_evening
         
-        # === 2) CHEAP HOUR CHARGING (WITH SOC HEADROOM CONSTRAINT) ===
-        # SCALED DOWN: Removed clipping, so rewards are proportional to energy
-        elif p_battery < -1e-3:  # Charging
-            # First check: if already at max SOC, penalize immediately (no rewards)
-            if self.soc >= self.soc_max - 0.05:
-                reward += -20.0  # Very strong penalty for trying to charge at max SOC
-            elif hour in self.cheapest_hours:
-                # Reward charging during cheap hours, but penalize if too close to max SOC
-                # This prevents the local optimum of charging to max too early
-                soc_headroom = self.soc_max - self.soc
-                
-                if has_upcoming_peak:
-                    # Before upcoming peak hours: reward charging but penalize approaching max SOC
-                    # This prevents charging to max before morning OR evening peak
-                    if soc_headroom > 0.15:  # Good headroom (>15% remaining)
-                        base_charge_reward = 3.0  # Reduced from 8.0
-                        energy_bonus = cheap_factor * energy_mwh * 4.0  # 4.0 per MWh (reduced from 15.0)
-                        # Max theoretical: 3.0 + 1.0 * 20 * 4.0 = 83.0 for full charge
-                        reward += base_charge_reward + energy_bonus
-                    elif soc_headroom > 0.05:  # Moderate headroom (5-15%)
-                        # Diminishing returns - still reward but less
-                        base_charge_reward = 2.0  # Reduced from 4.0
-                        energy_bonus = cheap_factor * energy_mwh * 2.5  # 2.5 per MWh (reduced from 10.0)
-                        # Max theoretical: 2.0 + 1.0 * 20 * 2.5 = 52.0 for full charge
-                        reward += base_charge_reward + energy_bonus
-                    else:  # Too close to max SOC (<5% headroom)
-                        # Strong penalty for charging when already near max
-                        reward += -10.0  # Penalty for charging to max too early
-                else:
-                    # After all peak hours: charging is less valuable (end of day)
-                    base_charge_reward = 2.0  # Reduced from 5.0
-                    energy_bonus = cheap_factor * energy_mwh * 2.5  # 2.5 per MWh (reduced from 10.0)
-                    # Max theoretical: 2.0 + 1.0 * 20 * 2.5 = 52.0 for full charge
-                    reward += base_charge_reward + energy_bonus
-            else:
-                # Charging outside cheap hours
-                # BUT: Allow charging between peaks if SOC is low and evening peak is coming
-                # This enables the second cycle (charge between morning and evening peaks)
-                if has_upcoming_peak and self.soc < 0.3:
-                    # Low SOC with upcoming peak: reward charging to prepare for evening peak
-                    # This is critical for two-cycle strategy
-                    soc_headroom = self.soc_max - self.soc
-                    if soc_headroom > 0.15:  # Good headroom
-                        # Reward charging between peaks, but less than during cheapest hours
-                        base_charge_reward = 2.0  # Base reward for preparing for evening peak
-                        # Use price factor (cheaper = better, but not as strong as cheapest hours)
-                        price_factor = max(0.0, (price_max - price_em) / price_range)  # How cheap relative to max
-                        energy_bonus = price_factor * energy_mwh * 2.0  # 2.0 per MWh (scaled by price)
-                        reward += base_charge_reward + energy_bonus
-                    elif soc_headroom > 0.05:  # Moderate headroom
-                        base_charge_reward = 1.0
-                        price_factor = max(0.0, (price_max - price_em) / price_range)
-                        energy_bonus = price_factor * energy_mwh * 1.5
-                        reward += base_charge_reward + energy_bonus
-                    # If too close to max, no reward (but also no penalty - let arbitrage handle it)
-                else:
-                    # Charging outside cheap hours without good reason = suboptimal
-                    reward += -3.0  # Penalty for misaligned charge
-        
-        # === 3) IDLING REWARDS/PENALTIES ===
-        else:  # Idling (p_battery ≈ 0)
-            if hour in self.peak_hours:
-                # Idling during peak = missed major opportunity
-                if self.soc >= 0.85:  # High SOC (>= 85%) at peak = worst case
-                    # Full SOC at peak = worst case
-                    reward += -25.0  # Very strong penalty
-                elif self.soc <= self.soc_min + 0.05:
-                    # At min SOC - can't discharge anyway, but still poor planning
-                    reward += -5.0  # Moderate penalty (less than if could discharge)
-                else:
-                    # Can discharge but choosing not to
-                    reward += -8.0  # Strong penalty for idling at peak
-            elif hour in self.cheapest_hours:
-                # Idling during cheap hours = missed charging opportunity
-                reward += -4.0  # Moderate penalty
-            else:
-                # Idling during normal hours = acceptable strategy
-                # BUT: If SOC is very low, it's a missed opportunity to charge
-                if self.soc < 0.3:
-                    # Low SOC - should have charged, missed opportunity
-                    reward += 0.0  # No reward, but no strong penalty either
-                else:
-                    # Preserves battery state, avoids unnecessary degradation
-                    reward += 5.0  # Small reward for smart idling
-        
-        # === 4) ADDITIONAL CONSTRAINTS ===
-        # Penalize reaching max SOC before upcoming peak hours (critical for breaking local optimum)
-        # This applies before BOTH morning and evening peaks
-        if has_upcoming_peak and self.soc >= self.soc_max - 0.05:
-            # Reached max SOC too early - can't discharge at upcoming peak
-            reward += -20.0  # Very strong penalty
-        
-        # Reward maintaining good SOC headroom before upcoming peak hours
-        if has_upcoming_peak and 0.3 < self.soc < 0.7:
-            # Sweet spot: have energy stored but room for more
-            reward += 3.0  # Bonus for maintaining good headroom
-        
-        # Penalize being at min SOC during peak hours (can't discharge)
-        if hour in self.peak_hours and self.soc <= self.soc_min + 0.05:
-            reward += -15.0  # Strong penalty for empty battery at peak
-        
-        # Penalize discharging when already at min SOC (regardless of hour)
-        # Note: This is checked here as a fallback, but should be caught in discharge logic above
-        if p_battery > 1e-3 and self.soc <= self.soc_min + 0.05:
-            reward += -15.0  # Strong penalty for trying to discharge at min SOC
+        # Deadband: treat very small deltas as idle to let the policy sit at 0
+        idle_deadband = 0.01
+        is_idle = abs(delta) < idle_deadband
 
-        # === 5) ARBITRAGE-SENSITIVE NET PROFIT (replaces cycle penalty) ===
-        # Calculate net profitability: arbitrage opportunity - degradation cost
-        # This allows the agent to learn optimal cycling based on economic trade-offs
-        # The agent can find the optimal cycling amount based on degradation and arbitrage
+        # Cheapness multipliers per upcoming peak window (0→not cheap, 1→cheapest)
+        cheap_multiplier = 0.0
+        if hour < getattr(self, "k_morn", -1) and hasattr(self, "morning_price_min"):
+            price_min = max(1e-6, getattr(self, "morning_price_min", price_em))
+            price_max = max(price_min, getattr(self, "morning_price_max", price_em))
+            cheap_multiplier = float(np.clip((price_max - price_em) / max(1e-6, price_max - price_min), 0.0, 1.0))
+        elif getattr(self, "k_morn", -1) <= hour < getattr(self, "k_even", -1) and hasattr(self, "evening_price_min"):
+            price_min = max(1e-6, getattr(self, "evening_price_min", price_em))
+            price_max = max(price_min, getattr(self, "evening_price_max", price_em))
+            cheap_multiplier = float(np.clip((price_max - price_em) / max(1e-6, price_max - price_min), 0.0, 1.0))
+
+        # === 1) CONSTRAINT VIOLATIONS (CHECK BY ACTION INTENT, NOT p_battery) ===
+        # Penalize trying to discharge at min SOC or charge at max SOC
+        if not is_idle:
+            if delta > 1e-3 and self.soc <= self.soc_min + 0.05:
+                reward += -15.0 * abs(delta)
+            
+            if delta < -1e-3 and self.soc >= self.soc_max - 0.05:
+                reward += -20.0 * abs(delta)
         
-        # Calculate degradation per MWh for net profitability calculation
-        degradation_per_mwh = cost_degradation / max(energy_mwh, 1e-6)
-        
-        # Calculate arbitrage opportunity per MWh
-        arbitrage_per_mwh = 0.0
-        next_peak_price = None
-        previous_cheap_price = None
-        
-        # Get next peak hour and price for arbitrage calculation (reuse next_peak_hour_shaping if available)
-        next_peak_hour_arb = next_peak_hour_shaping
-        if next_peak_hour_arb is None and self.peak_hours:
-            # If current hour is in peak hours, use current hour
-            if hour in self.peak_hours:
-                next_peak_hour_arb = hour
+        # === 2) REWARD DISCHARGING AT PEAKS ===
+        if not is_idle and p_battery > 1e-3:  # Discharging
+            if is_any_peak:
+                # Discharging at peak - reward strongly, scale by energy
+                base_reward = 5.0
+                energy_bonus = energy_mwh * 5.0
+                reward += base_reward + energy_bonus
             else:
-                # Find next peak hour
-                for h in sorted(self.peak_hours):
-                    if h > hour:
-                        next_peak_hour_arb = h
-                        break
+                reward += -5.0
         
-        if next_peak_hour_arb is not None and 0 <= next_peak_hour_arb < 24:
-            try:
-                next_peak_price = self.day_data.iloc[next_peak_hour_arb]['price_em']
-                # Store normalized value, will denormalize when calculating arbitrage
-            except:
-                pass
+        # === 3) REWARD CHARGING IN CHEAPEST HOURS BEFORE PEAKS ===
+        elif not is_idle and p_battery < -1e-3:  # Charging
+            if is_cheap_before_morning or is_cheap_before_evening:
+                # Scale bonus by how cheap this hour is within its window (0..1)
+                base_reward = 5.0
+                energy_bonus = energy_mwh * 4.0
+                reward += (base_reward + energy_bonus) * cheap_multiplier
+            elif is_any_peak:
+                reward += -8.0
+            else:
+                reward += -5.0
         
-        # Get previous cheap price for discharging arbitrage
-        if hasattr(self, 'cheapest_hours') and self.cheapest_hours:
-            try:
-                cheap_prices = []
-                for h in self.cheapest_hours:
-                    if h < hour and 0 <= h < 24:
-                        try:
-                            p_norm = self.day_data.iloc[h]['price_em']
-                            p = self._denormalize('price_em', p_norm)
-                            if p > 0:  # Only valid prices
-                                cheap_prices.append(p)
-                        except:
-                            continue
-                if cheap_prices:
-                    previous_cheap_price = min(cheap_prices)
+        # === 4) REWARD IDLING IN OTHER HOURS (NOT PEAK, NOT CHEAP) ===
+        else:  # Idling
+            if is_any_peak:
+                # Idling at peak - missed opportunity
+                if self.soc >= 0.5:
+                    reward += -10.0  # Can discharge but not doing it
                 else:
-                    # Fallback: use minimum of all past prices
-                    past_prices = []
-                    for h in range(hour):
-                        try:
-                            p_norm = self.day_data.iloc[h]['price_em']
-                            p = self._denormalize('price_em', p_norm)
-                            if p > 0:
-                                past_prices.append(p)
-                        except:
-                            continue
-                    if past_prices:
-                        previous_cheap_price = min(past_prices)
-            except:
-                pass
-        
-        # Calculate arbitrage per MWh based on action direction
-        # Note: price_em is already denormalized (used directly in revenue calculations)
-        if p_battery < -1e-3:  # Charging
-            # Arbitrage = next peak price - current price
-            if next_peak_price is not None:
-                # Denormalize next_peak_price if it's from day_data (which has normalized prices)
-                try:
-                    next_peak_price_raw = self._denormalize('price_em', next_peak_price)
-                except:
-                    next_peak_price_raw = next_peak_price  # Assume already denormalized
-                arbitrage_per_mwh = max(0.0, next_peak_price_raw - price_em)
-        elif p_battery > 1e-3:  # Discharging
-            # Arbitrage = current price - previous cheap price
-            if previous_cheap_price is not None:
-                # previous_cheap_price is already denormalized (we denormalized it above)
-                arbitrage_per_mwh = max(0.0, price_em - previous_cheap_price)
-        # else: Idling - no arbitrage
-        
-        # Calculate net profit per MWh
-        net_profit_per_mwh = arbitrage_per_mwh - degradation_per_mwh
-        
-        # Total net profit for this action (scaled to reward range)
-        # The overall reward is now normalized by 100.0, so this individual scaling is removed.
-        net_profit_scaled = (net_profit_per_mwh * energy_mwh)
-        
-        # Add net profit to reward (replaces cycle penalty)
-        reward += net_profit_scaled
+                    reward += -5.0  # Can't discharge anyway
+            elif is_cheap_before_morning or is_cheap_before_evening:
+                # Idling during cheap hours - missed charging opportunity
+                reward += -5.0
+            else:
+                # Idling at other times - reward (similar to discharge/charge base)
+                reward += 10.0
 
         # NO CLIPPING: Rewards are now proportional to action magnitude
         # Small actions get small rewards, large actions get large rewards
         # This ensures the agent can distinguish between different action magnitudes
-        # Small rewards/penalties (e.g., +3.0, +5.0, -3.0) remain meaningful relative to larger ones
+        # Reward structure:
+        # - Discharge at peak: 5.0 + 5.0 * energy_mwh
+        # - Charge at cheap (before peaks): 5.0 + 4.0 * energy_mwh
+        # - Idle at other times: 5.0 (similar base reward to encourage idling)
         # Max theoretical reward: ~105.0 (full discharge at peak)
         # Max theoretical penalty: ~-25.0 (idle at peak with full SOC)
         reward_unnormalized = float(reward)  # Store unnormalized reward for debugging
@@ -840,7 +761,8 @@ class BESSEnv(gym.Env):
         # Normalize rewards to prevent Q-value underestimation and scale mismatch
         # Divide by normalization factor to keep rewards in reasonable range for Q-learning
         # This ensures Q-values can learn positive values and match episode returns
-        normalization_factor = 100.0  # Scale factor to normalize rewards
+        # Reduced from 25.0 to 20.0 to make reward signal stronger and easier to learn
+        normalization_factor = 20.0  # Scale factor to normalize rewards
         reward = float(reward) / normalization_factor  # Normalize rewards
 
 
@@ -872,10 +794,6 @@ class BESSEnv(gym.Env):
             'revenue_energy': revenue_energy,
             'revenue_reserve': revenue_reserve,
             'cost_degradation': cost_degradation,
-            'degradation_per_mwh': degradation_per_mwh,
-            'arbitrage_per_mwh': arbitrage_per_mwh,
-            'net_profit_per_mwh': net_profit_per_mwh,
-            'net_profit_scaled': net_profit_scaled,
             'delta_soc': delta_soc,
             'energy_mwh': energy_mwh,
             'peak_hour': hour in peak_hours if isinstance(peak_hours, set) else False,

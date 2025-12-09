@@ -3,6 +3,7 @@
 algorithm:
   name: TD3
   gamma: 0.995        # discount factor (0.99 for stability, avoids exploding Q-values)
+  n_step: 1           # n-step return horizon for faster credit assignment
   tau: 0.01              # Polyak (faster target updates to track policy changes better)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)

@@ -154,9 +154,11 @@ def test_scenario(env, scenario_name, hour, action, soc_start, description, setu
     p_battery = info.get('p_battery', 0.0)
     energy_mwh = info.get('energy_mwh', 0.0)
     cost_degradation = info.get('cost_degradation', 0.0)
-    degradation_per_mwh = info.get('degradation_per_mwh', 0.0)
-    arbitrage_per_mwh = info.get('arbitrage_per_mwh', 0.0)
-    net_profit_per_mwh = info.get('net_profit_per_mwh', 0.0)
+    # Note: These fields were removed when we simplified reward shaping
+    # They're kept for compatibility with the test script but always return 0.0
+    degradation_per_mwh = 0.0
+    arbitrage_per_mwh = 0.0
+    net_profit_per_mwh = 0.0
     net_profit_scaled = info.get('net_profit_scaled', 0.0)
     soc_after = info.get('soc', env.soc)
     dod_current = info.get('dod_morning', 0.0) if env.current_hour < 12 else info.get('dod_evening', 0.0)
