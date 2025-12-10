@@ -58,11 +58,7 @@ class HourlyData:
     revenue_energy: float  # Revenue from energy market (negative if buying)
     revenue_reserve: float  # Revenue from reserve provision
     degradation_cost: float  # Battery degradation cost
-    reward: float  # Step reward (revenue - degradation)
-    reward_base: float  # Raw market reward prior to shaping
-    reward_with_shaping: float  # Reward after adding shaping signals (pre-normalization)
-    reward_final: float  # Final reward passed to learner (post-normalization if any)
-    reward_shaping_component: float  # Net contribution from shaping terms
+    reward: float  # Step reward (revenue - degradation, pure economics)
     
     # Cumulative metrics (EUR)
     cumulative_revenue: float
@@ -300,7 +296,7 @@ def evaluate_td3_agent(
             cumulative_degradation = totals["degradation"]
             cumulative_profit = cumulative_revenue - cumulative_degradation
 
-            reward = float(info.get("reward_final", info.get("reward", reward)))
+            reward = float(info.get("reward", reward))
 
             # Store comprehensive hourly data
             hourly_data.append(
@@ -325,10 +321,6 @@ def evaluate_td3_agent(
                     revenue_reserve=float(info.get("revenue_reserve", 0.0)),
                     degradation_cost=float(info.get("cost_degradation", 0.0)),
                     reward=reward,
-                    reward_base=float(info.get("reward_base", 0.0)),
-                    reward_with_shaping=float(info.get("reward_shaping", reward)),
-                    reward_final=float(info.get("reward_final", reward)),
-                    reward_shaping_component=float(info.get("reward_shaping", reward)),
                     cumulative_revenue=cumulative_revenue,
                     cumulative_degradation=cumulative_degradation,
                     cumulative_profit=cumulative_profit,
@@ -364,11 +356,12 @@ def evaluate_td3_agent(
             np.sum(np.abs(p_battery_values)) * dt
         )  # Sum of |power| * dt
 
-        # Estimate cycles: throughput / (capacity * avg_dod)
+        # Estimate cycles: throughput / (2 * capacity * avg_dod)
+        # One full cycle = charge (capacity * DOD) + discharge (capacity * DOD) = 2 * capacity * DOD
         # If no DOD, assume shallow cycle (DOD = 0.1 for safety)
         avg_dod = max(dod_max_overall, 0.1) if dod_max_overall > 0 else 0.1
         capacity_mwh = float(env.E_capacity)
-        charge_cycles = energy_throughput_mwh / (capacity_mwh * avg_dod) if avg_dod > 0 else 0.0
+        charge_cycles = energy_throughput_mwh / (2.0 * capacity_mwh * avg_dod) if avg_dod > 0 else 0.0
 
         # Operational metrics
         action_mean = float(np.mean(action_values)) if action_values else 0.0
@@ -437,8 +430,12 @@ def evaluate_baseline_comprehensive(
 
         final_info: Dict[str, float] = {}
 
-        for hour, delta in enumerate(plan):
-            action = np.array([float(np.clip(delta, -1.0, 1.0))], dtype=np.float32)
+        for hour, action_value in enumerate(plan):
+            # Plan is already in [0, 1] format - use directly
+            # The environment will interpret it correctly based on peak windows:
+            # - In peak windows: action=1 → discharge, action=0 → idle
+            # - Outside peak windows: action=1 → charge, action=0 → idle
+            action = np.array([float(np.clip(action_value, 0.0, 1.0))], dtype=np.float32)
             next_obs, reward, terminated, truncated, info = env.step(action)
 
             # Collect metrics
@@ -451,7 +448,7 @@ def evaluate_baseline_comprehensive(
             dod_evening_values.append(dod_evening)
             p_battery = float(info.get("p_battery", 0.0))
             p_battery_values.append(p_battery)
-            action_values.append(float(delta))
+            action_values.append(float(action_value))
             
             # IMPORTANT: Denormalize observation features ONLY for CSV output/display
             # The agent and environment still use normalized values internally.
@@ -477,8 +474,8 @@ def evaluate_baseline_comprehensive(
             hourly_data.append(
                 HourlyData(
                     hour=hour,
-                    action=float(delta),
-                    delta=float(info.get("delta", delta)),
+                    action=float(action_value),
+                    delta=float(info.get("delta", action_value)),
                     is_discharge_slot=bool(info.get("is_discharge_slot", False)),
                     soc=soc,
                     soc_before=soc_before,
@@ -496,10 +493,6 @@ def evaluate_baseline_comprehensive(
                     revenue_reserve=float(info.get("revenue_reserve", 0.0)),
                     degradation_cost=float(info.get("cost_degradation", 0.0)),
                     reward=reward,
-                    reward_base=float(info.get("reward_base", 0.0)),
-                    reward_with_shaping=float(info.get("reward_shaping", reward)),
-                    reward_final=float(info.get("reward_final", reward)),
-                    reward_shaping_component=float(info.get("reward_shaping", reward)),
                     cumulative_revenue=cumulative_revenue,
                     cumulative_degradation=cumulative_degradation,
                     cumulative_profit=cumulative_profit,
@@ -533,9 +526,11 @@ def evaluate_baseline_comprehensive(
         dt = env.dt
         energy_throughput_mwh = float(np.sum(np.abs(p_battery_values)) * dt)
 
+        # Estimate cycles: throughput / (2 * capacity * avg_dod)
+        # One full cycle = charge (capacity * DOD) + discharge (capacity * DOD) = 2 * capacity * DOD
         avg_dod = max(dod_max_overall, 0.1) if dod_max_overall > 0 else 0.1
         capacity_mwh = float(env.E_capacity)
-        charge_cycles = energy_throughput_mwh / (capacity_mwh * avg_dod) if avg_dod > 0 else 0.0
+        charge_cycles = energy_throughput_mwh / (2.0 * capacity_mwh * avg_dod) if avg_dod > 0 else 0.0
 
         action_mean = float(np.mean(action_values)) if action_values else 0.0
         discharge_hours = sum(1 for p in p_battery_values if p > 0)

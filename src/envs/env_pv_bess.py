@@ -39,10 +39,9 @@ class BESSEnv(gym.Env):
         - Planning aids: time_to_peak_hour, prior-step SOC (to expose delta SOC directly)
         - Explicit indicators: is_peak_hour, is_cheap_before_peak (binary: 1.0 = yes, -1.0 = no)
     
-    Action: Continuous value δ ∈ [-1, 1]
-        - δ < 0: Charge (magnitude scales charging power)
-        - δ > 0: Discharge (magnitude scales discharging power)
-        - δ = 0: Idle
+    Action: Continuous value a ∈ [0, 1]
+        - In peak windows: a = 1 → discharge, a = 0 → idle
+        - Outside peak windows: a = 1 → charge, a = 0 → idle
     
     In other words, the agent "moves" energy in and out of the battery over the day.
     """
@@ -89,9 +88,9 @@ class BESSEnv(gym.Env):
         self.throughput_penalty_eur_per_mwh = 150.0
 
         # Define action and observation spaces
-        # Action: δ ∈ [-1, 1] - negative = charge, positive = discharge, 0 = idle
+        # Action: a ∈ [0, 1] - in peak windows: 1 = discharge, 0 = idle; outside peaks: 1 = charge, 0 = idle
         self.action_space = spaces.Box(
-            low=-1.0,
+            low=0.0,
             high=1.0,
             shape=(1,),
             dtype=np.float32
@@ -266,7 +265,7 @@ class BESSEnv(gym.Env):
         
         # Get all rows (hours) for the chosen day
         self.day_data = self.data[self.data['date'] == self.current_day].reset_index(drop=True)
-        # Cache denormalized day-ahead prices for reward shaping or diagnostics
+        # Cache denormalized day-ahead prices for diagnostics
         try:
             prices_norm = self.day_data['price_em'].astype(float).to_numpy()
             prices_raw = np.array([self._denormalize('price_em', float(v)) for v in prices_norm], dtype=float)
@@ -285,7 +284,7 @@ class BESSEnv(gym.Env):
             self.day_price_range_raw = float('nan')
 
         # Compute morning/evening price peaks directly from today's price curve.
-        # These are later used to build peak windows for reward shaping.
+        # These are later used to build peak windows for action interpretation.
         try:
             prices = np.asarray(self._day_prices_raw, dtype=float)
             assert prices.shape[0] == 24
@@ -301,7 +300,7 @@ class BESSEnv(gym.Env):
                 self.k_morn = -1
                 self.k_even = -1
 
-        # Compute cheapest hours before each peak for reward shaping
+        # Compute cheapest hours before each peak (for diagnostics/info)
         # Find 3 cheapest hours before morning peak and 3 cheapest hours before evening peak
         try:
             if self._day_prices_raw is not None and len(self._day_prices_raw) >= 2:
@@ -469,7 +468,7 @@ class BESSEnv(gym.Env):
         t2p_norm = 2.0 * ((time_to_next_peak_hour - t2p_min) / t2p_range) - 1.0
         t2p_norm = float(np.clip(t2p_norm, -1.0, 1.0))
 
-        # Compute explicit binary indicators for reward shaping
+        # Compute explicit binary indicators for observation features
         # These help the agent directly identify when to act
         hour = self.current_hour
         morning_peak_hours = getattr(self, 'morning_peak_hours', set())
@@ -540,23 +539,34 @@ class BESSEnv(gym.Env):
           2. Enforce all physical/grid/SOC limits.
           3. Route PV and battery power to grid / charging.
           4. Update SOC and degradation.
-          5. Compute revenues + reward shaping.
+          5. Compute revenues and degradation cost (pure economics).
           6. Advance the hour and return the next observation and reward.
 
         Conventions:
-          * ``action[0]`` in [-1, 1]:
-                < 0  → charge,
-                > 0  → discharge,
-                = 0  → idle.
+          * ``action[0]`` in [0, 1]:
+                In peak windows: 1 → discharge, 0 → idle
+                Outside peak windows: 1 → charge, 0 → idle
           * All power values are in MW, energies in MWh, prices in €/MWh.
         """
         # === ACTION PARSING: map policy output to physical power command ===
-        # delta ∈ [-1,1] maps linearly to battery power [-Pmax, +Pmax]
-        delta = float(np.clip(action[0], -1.0, 1.0))
-        p_battery_cmd = delta * self.P_bess_max  # MW (unconstrained command)
-
+        # action ∈ [0,1] - interpret based on peak windows
+        action_value = float(np.clip(action[0], 0.0, 1.0))
+        
         # --- 1) Fetch current data (denormalized)
         hour = self.current_hour
+        
+        # Determine if we're in a peak window
+        morning_peak_hours = getattr(self, 'morning_peak_hours', set())
+        evening_peak_hours = getattr(self, 'evening_peak_hours', set())
+        is_in_peak_window = (hour in morning_peak_hours or hour in evening_peak_hours)
+        
+        # Interpret action based on peak window
+        if is_in_peak_window:
+            # During peak: action = 1 → discharge, action = 0 → idle
+            p_battery_cmd = action_value * self.P_bess_max  # Positive = discharge
+        else:
+            # Outside peak: action = 1 → charge, action = 0 → idle
+            p_battery_cmd = -action_value * self.P_bess_max  # Negative = charge
         row = self.day_data.iloc[hour]
 
         price_em = self._denormalize('price_em', row['price_em'])      # €/MWh (energy market)
@@ -616,8 +626,11 @@ class BESSEnv(gym.Env):
                 pv_to_charge = min(p_pv_t, -p_battery)
                 p_pv_grid = p_pv_t - pv_to_charge
                 p_bess_em = -( (-p_battery) - pv_to_charge )
-
-            poi_headroom = max(0.0, self.P_poi_max - (p_pv_grid + max(p_bess_em, 0.0)))
+            
+            # Re-check reserve constraints with updated flows (activation-feasible headroom)
+            # Reserve is capacity, not actual export, so check POI headroom for hypothetical activation
+            current_export = p_pv_grid + max(p_bess_em, 0.0)
+            poi_headroom = max(0.0, self.P_poi_max - current_export)
             p_reserve_feas = min(p_reserve_feas, poi_headroom)
 
         p_reserve = p_reserve_feas
@@ -638,132 +651,18 @@ class BESSEnv(gym.Env):
         revenue_reserve  = p_reserve  * price_as * dt         # €/step
         cost_degradation = self._calculate_degradation_cost(p_battery)
         
-        raw_reward = (
+        # Pure economics: revenue - degradation cost
+        reward = (
              revenue_pv_grid
              + revenue_energy
              + revenue_reserve
              - cost_degradation
         )
+        
+        # Normalize reward by dividing by 700
+        reward = float(reward) / 500.0
+        
         self.daily_throughput += abs(p_battery) * dt
-        
-        # --- Price structure factors (how cheap/expensive is this hour?) ---
-        price_min = getattr(self, "day_price_min_raw", price_em)
-        price_max = getattr(self, "day_price_max_raw", price_em)
-        price_range = max(1e-6, price_max - price_min)
-        cheap_factor = float(np.clip((price_max - price_em) / price_range, 0.0, 1.0))
-        expensive_factor = float(np.clip((price_em - price_min) / price_range, 0.0, 1.0))
-
-        # --- Upcoming peak hour (used for pre-peak shaping) ---
-        next_peak_hour = None
-        if hasattr(self, "peak_hours"):
-            for h in sorted(self.peak_hours):
-                if h >= hour:
-                    next_peak_hour = h
-                    break
-        hours_to_peak = None
-        if next_peak_hour is not None:
-            hours_to_peak = int(max(0, next_peak_hour - hour))
-        peak_hours = getattr(self, "peak_hours", set())
-
-        # === SIMPLE REWARD SHAPING ===
-        # Basic two-cycle strategy:
-        # 1. Charge in 3 cheapest hours before morning peak
-        # 2. Discharge in morning peak
-        # 3. Charge in 3 cheapest hours before evening peak
-        # 4. Discharge in evening peak
-        reward = 0.0
-        
-        # Get peak hours and cheapest hours before peaks
-        morning_peak_hours = getattr(self, 'morning_peak_hours', set())
-        evening_peak_hours = getattr(self, 'evening_peak_hours', set())
-        is_morning_peak = hour in morning_peak_hours
-        is_evening_peak = hour in evening_peak_hours
-        is_any_peak = is_morning_peak or is_evening_peak
-        
-        cheapest_before_morning = getattr(self, 'cheapest_before_morning', set())
-        cheapest_before_evening = getattr(self, 'cheapest_before_evening', set())
-        is_cheap_before_morning = hour in cheapest_before_morning
-        is_cheap_before_evening = hour in cheapest_before_evening
-        
-        # Deadband: treat very small deltas as idle to let the policy sit at 0
-        idle_deadband = 0.01
-        is_idle = abs(delta) < idle_deadband
-
-        # Cheapness multipliers per upcoming peak window (0→not cheap, 1→cheapest)
-        cheap_multiplier = 0.0
-        if hour < getattr(self, "k_morn", -1) and hasattr(self, "morning_price_min"):
-            price_min = max(1e-6, getattr(self, "morning_price_min", price_em))
-            price_max = max(price_min, getattr(self, "morning_price_max", price_em))
-            cheap_multiplier = float(np.clip((price_max - price_em) / max(1e-6, price_max - price_min), 0.0, 1.0))
-        elif getattr(self, "k_morn", -1) <= hour < getattr(self, "k_even", -1) and hasattr(self, "evening_price_min"):
-            price_min = max(1e-6, getattr(self, "evening_price_min", price_em))
-            price_max = max(price_min, getattr(self, "evening_price_max", price_em))
-            cheap_multiplier = float(np.clip((price_max - price_em) / max(1e-6, price_max - price_min), 0.0, 1.0))
-
-        # === 1) CONSTRAINT VIOLATIONS (CHECK BY ACTION INTENT, NOT p_battery) ===
-        # Penalize trying to discharge at min SOC or charge at max SOC
-        if not is_idle:
-            if delta > 1e-3 and self.soc <= self.soc_min + 0.05:
-                reward += -15.0 * abs(delta)
-            
-            if delta < -1e-3 and self.soc >= self.soc_max - 0.05:
-                reward += -20.0 * abs(delta)
-        
-        # === 2) REWARD DISCHARGING AT PEAKS ===
-        if not is_idle and p_battery > 1e-3:  # Discharging
-            if is_any_peak:
-                # Discharging at peak - reward strongly, scale by energy
-                base_reward = 5.0
-                energy_bonus = energy_mwh * 5.0
-                reward += base_reward + energy_bonus
-            else:
-                reward += -5.0
-        
-        # === 3) REWARD CHARGING IN CHEAPEST HOURS BEFORE PEAKS ===
-        elif not is_idle and p_battery < -1e-3:  # Charging
-            if is_cheap_before_morning or is_cheap_before_evening:
-                # Scale bonus by how cheap this hour is within its window (0..1)
-                base_reward = 5.0
-                energy_bonus = energy_mwh * 4.0
-                reward += (base_reward + energy_bonus) * cheap_multiplier
-            elif is_any_peak:
-                reward += -8.0
-            else:
-                reward += -5.0
-        
-        # === 4) REWARD IDLING IN OTHER HOURS (NOT PEAK, NOT CHEAP) ===
-        else:  # Idling
-            if is_any_peak:
-                # Idling at peak - missed opportunity
-                if self.soc >= 0.5:
-                    reward += -10.0  # Can discharge but not doing it
-                else:
-                    reward += -5.0  # Can't discharge anyway
-            elif is_cheap_before_morning or is_cheap_before_evening:
-                # Idling during cheap hours - missed charging opportunity
-                reward += -5.0
-            else:
-                # Idling at other times - reward (similar to discharge/charge base)
-                reward += 50.0
-
-        # NO CLIPPING: Rewards are now proportional to action magnitude
-        # Small actions get small rewards, large actions get large rewards
-        # This ensures the agent can distinguish between different action magnitudes
-        # Reward structure:
-        # - Discharge at peak: 5.0 + 5.0 * energy_mwh
-        # - Charge at cheap (before peaks): 5.0 + 4.0 * energy_mwh
-        # - Idle at other times: 5.0 (similar base reward to encourage idling)
-        # Max theoretical reward: ~105.0 (full discharge at peak)
-        # Max theoretical penalty: ~-25.0 (idle at peak with full SOC)
-        reward_unnormalized = float(reward)  # Store unnormalized reward for debugging
-        
-        # === REWARD NORMALIZATION ===
-        # Normalize rewards to prevent Q-value underestimation and scale mismatch
-        # Divide by normalization factor to keep rewards in reasonable range for Q-learning
-        # This ensures Q-values can learn positive values and match episode returns
-        # Reduced from 25.0 to 20.0 to make reward signal stronger and easier to learn
-        normalization_factor = 20.0  # Scale factor to normalize rewards
-        reward = float(reward) / normalization_factor  # Normalize rewards
 
 
     
@@ -776,9 +675,14 @@ class BESSEnv(gym.Env):
         self.episode_revenue += (revenue_pv_grid + revenue_energy + revenue_reserve)
         self.episode_degradation += cost_degradation
 
+        # Get peak hours for info (if needed)
+        morning_peak_hours = getattr(self, 'morning_peak_hours', set())
+        evening_peak_hours = getattr(self, 'evening_peak_hours', set())
+        peak_hours = morning_peak_hours.union(evening_peak_hours)
+
         info = {
             'hour': hour,
-            'delta': delta,
+            'delta': action_value if is_in_peak_window else -action_value,  # Normalized action for logging
             'soc_previous': self.soc_previous,
             'soc_before': self.soc_previous,
             'soc': self.soc,
@@ -796,18 +700,11 @@ class BESSEnv(gym.Env):
             'cost_degradation': cost_degradation,
             'delta_soc': delta_soc,
             'energy_mwh': energy_mwh,
-            'peak_hour': hour in peak_hours if isinstance(peak_hours, set) else False,
-            'hours_to_peak': hours_to_peak,
+            'peak_hour': hour in peak_hours,
             'time_to_peak_hour_raw': time_to_peak_hour_raw,
             'reward': reward,
-            'reward_unnormalized': reward_unnormalized,  # Added for debugging
-            'reward_shaping': reward,
-            'reward_base': 0.0,
-            'reward_final': reward,
-            'is_cheap_hour': hour in self.cheapest_hours if hasattr(self, 'cheapest_hours') else False,
             'dod_morning': self.dod_morning,
             'dod_evening': self.dod_evening,
-            'mode': getattr(self, "mode", "shaping_only"),
         }
 
         self.current_hour += 1
@@ -848,6 +745,10 @@ class BESSEnv(gym.Env):
         """
         Apply battery, converter, SOC, and POI constraints (paper-aligned).
         Returns (p_battery_feasible, p_reserve_feasible)
+        
+        Reserve revenue is paid for CAPACITY, not energy. Reserve should be limited
+        only by feasible upward headroom (SOC, converter, POI), NOT by actual export.
+        Reserve can be > 0 during both charging and discharging.
         """
         # 1. SOC bounds and converter/battery limits
         pmax_dis = min(self.P_bess_max, self.P_conv_nom,
@@ -859,24 +760,43 @@ class BESSEnv(gym.Env):
         else:
             p_battery = max(p_battery, -pmax_ch)
 
-        # 2. POI export constraint (Eq. 15)
-        total_export = p_pv_grid + max(p_battery, 0.0) + p_reserve
-        if total_export > self.P_poi_max:
-            overflow = total_export - self.P_poi_max
-            if p_reserve > 0:
-                p_reserve = max(0.0, p_reserve - overflow)
-                total_export = p_pv_grid + max(p_battery, 0.0) + p_reserve
-            if total_export > self.P_poi_max:
-                p_battery = max(0.0, self.P_poi_max - p_pv_grid - p_reserve)
+        # 2. POI export constraint for ACTUAL export (reserve is NOT actual export)
+        # Only check actual export: PV to grid + battery discharge
+        current_export = p_pv_grid + max(p_battery, 0.0)
+        if current_export > self.P_poi_max:
+            # Clip battery discharge to satisfy POI limit
+            p_battery = max(0.0, self.P_poi_max - p_pv_grid)
 
-        # 3. Reserve feasibility (Eqs. 25–26)
+        # 3. Reserve feasibility (Eqs. 25–26) - based on ACTIVATION headroom, not actual export
+        # Reserve is capacity that could be activated, not instantaneous power flow
+        
+        # 3a. SOC headroom: upward power available from current SOC
         p_soc_headroom = max(0.0, (self.soc - self.soc_min) * self.E_capacity / self.dt)
-        p_dis_max_prime = min(self.P_bess_max, self.P_conv_nom, p_soc_headroom)
-        poi_headroom = max(0.0, self.P_poi_max - (p_pv_grid + max(p_battery, 0.0)))
-        # Converter upward headroom from current operating point:
-        # If charging at -c, you must first cancel c before providing upward reserve.
-        conv_up_headroom = max(0.0, self.P_conv_nom - max(0.0, -p_battery))
-        p_reserve = min(p_reserve, p_dis_max_prime - max(p_battery, 0.0), poi_headroom, conv_up_headroom)
+        
+        # 3b. Converter upward headroom: how much more upward power converter can provide
+        # If battery is charging at -c MW, it has (P_conv_nom + c) upward room
+        #   (can reduce charging by c, then provide P_conv_nom upward)
+        # If battery is discharging at d MW, it has (P_conv_nom - d) upward room
+        #   (can increase discharge up to P_conv_nom)
+        if p_battery < 0:  # Charging
+            conv_up_headroom = self.P_conv_nom + abs(p_battery)  # p_battery is negative
+        else:  # Discharging or idle
+            conv_up_headroom = max(0.0, self.P_conv_nom - p_battery)
+        
+        # 3c. POI headroom: if reserve were activated, would POI limit be violated?
+        # Check hypothetical activation: current export + reserve activation
+        poi_headroom = max(0.0, self.P_poi_max - current_export)
+        
+        # 3d. Final reserve constraint: limited by all headroom constraints
+        p_reserve = min(
+            p_reserve,
+            p_soc_headroom,
+            conv_up_headroom,
+            poi_headroom
+        )
+        
+        # Ensure reserve is non-negative
+        p_reserve = max(0.0, p_reserve)
 
         return p_battery, p_reserve
 
@@ -990,24 +910,44 @@ class BESSEnv(gym.Env):
 
     def _calculate_degradation_cost_nonlinear(self, p_battery: float) -> float:
         """
-        Non-linear DOD-based degradation (paper Eqs. 16–19).
-        Returns cost in EUR per step.
+        Non-linear degradation cost following the paper (Eqs. 16–20),
+        correctly scaled using energy throughput (MWh) instead of MW.
+        
+        Eq. (16): C_cyc = CBESS / (Emax * DOD_max * N_cycles)
+        Eq. (17): CF_cyc(k) = zfactor(k) * C_cyc
+        Eq. (18): DOD(k) = SOC_max(part_i) - SOC_min(part_i) [updated continuously]
+        Eq. (20): DegradationPenalty(k) = Energy_Throughput(k) * (CF_cyc(k) / 2)
+        
+        Returns cost in EUR per step (hour).
         """
-        Emax_MWh = float(self.E_capacity)
-        CBESS = float(self.capex_eur_per_mwh) * Emax_MWh
+        # Convert exchanged energy for this timestep (MWh)
+        energy_throughput = abs(p_battery) * self.dt  # MW × h → MWh
+
+        if energy_throughput <= 0:
+            return 0.0
+
+        # Battery parameters
+        Emax = float(self.E_capacity)
+        CBESS = float(self.capex_eur_per_mwh) * Emax
         DOD_max = float(self.dod_max_for_cost)
         N_cycles = float(self.n_cycles_at_dod_max)
 
-        # Base cycling cost C_cyc (per MWh throughput at DOD_max)
-        C_cyc_per_MWh = CBESS / max(1e-6, Emax_MWh * DOD_max * N_cycles)
+        # Eq. (16): Base cycle cost per MWh at DOD_max
+        C_cyc = CBESS / max(1e-6, Emax * DOD_max * N_cycles)
 
-        # Current DOD bucket and multiplier
+        # Eq. (18): Current cycle depth (morning/evening)
         current_dod = self._get_current_dod()
-        z = self._z_factor_from_dod(current_dod)
-        Cdyn_per_MWh = z * C_cyc_per_MWh
 
-        energy_throughput_MWh = abs(p_battery) * self.dt
-        return float(energy_throughput_MWh * Cdyn_per_MWh)
+        # Eq. (19): z-factor
+        z = self._z_factor_from_dod(current_dod)
+
+        # Eq. (17): Dynamic cost factor
+        CF_cyc = z * C_cyc
+
+        # Eq. (20): Degradation penalty using *energy*, not power
+        degradation = energy_throughput * (CF_cyc / 2.0)
+
+        return float(degradation)
 
     
     def render(self):

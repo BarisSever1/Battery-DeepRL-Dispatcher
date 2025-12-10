@@ -255,7 +255,7 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         # Discharge in morning peak or evening peak
         if hour in peak_hours:
             if soc <= soc_min + 0.05:
-                # At min SOC - can't discharge, small action (will be clipped)
+                # At min SOC - can't discharge, idle
                 action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
             elif soc > 0.3:
                 # Strong discharge during peak hours (matches reward shaping)
@@ -268,16 +268,16 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         # Charge in 3 cheapest hours before morning peak or before evening peak
         elif hour in cheapest_before_morning or hour in cheapest_before_evening:
             if soc >= soc_max - 0.05:
-                # At max SOC - avoid charging (will be penalized)
-                action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
+                # At max SOC - avoid charging (will be penalized), idle
+                action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
             else:
                 # Strong charging in cheapest hours before peaks (matches reward shaping)
-                action = np.random.uniform(-1.0, -0.6, size=(1,)).astype(np.float32)
+                action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
         
         # === 3) IDLING / OTHER HOURS ===
         else:
             # Other hours - idle (matches reward shaping: neutral/idle reward)
-            action = np.random.uniform(-0.1, 0.1, size=(1,)).astype(np.float32)
+            action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
         
         return action
     except Exception:
@@ -360,10 +360,6 @@ def quick_rollout(env: BESSEnv, agent: TD3Agent, rollout_date: str) -> List[Dict
             "revenue_reserve": float(info.get("revenue_reserve", 0.0)),
             "degradation_cost": float(info.get("cost_degradation", 0.0)),
             "reward": float(reward),
-            "reward_base": float(info.get("reward_base", info.get("raw_reward", 0.0))),
-            "reward_with_shaping": float(info.get("reward_with_shaping", info.get("raw_reward", 0.0) + info.get("reward_shaping", 0.0))),
-            "reward_final": float(info.get("reward_final", reward)),
-            "reward_shaping_component": float(info.get("reward_shaping", 0.0)),
             "q1_eval": q1_value,
             "q2_eval": q2_value,
             "cumulative_revenue": cumulative_revenue,
@@ -558,10 +554,15 @@ def main() -> None:
                         action_val = float(action[0])
                         warmup_actions['min_action'] = min(warmup_actions['min_action'], action_val)
                         warmup_actions['max_action'] = max(warmup_actions['max_action'], action_val)
-                        if action_val < -0.1:
-                            warmup_actions['charge'] += 1
-                        elif action_val > 0.1:
-                            warmup_actions['discharge'] += 1
+                        # Determine charge/discharge based on peak windows and action value
+                        morning_peak_hours = getattr(env, 'morning_peak_hours', set())
+                        evening_peak_hours = getattr(env, 'evening_peak_hours', set())
+                        is_in_peak_window = (env.current_hour in morning_peak_hours or env.current_hour in evening_peak_hours)
+                        if action_val > 0.1:
+                            if is_in_peak_window:
+                                warmup_actions['discharge'] += 1
+                            else:
+                                warmup_actions['charge'] += 1
                         else:
                             warmup_actions['idle'] += 1
                     else:
@@ -606,7 +607,8 @@ def main() -> None:
                             print(f"\n[Warmup Complete] Buffer size: {len(buffer)}")
                             print(f"  Action distribution: Charge={charge_pct:.1f}%, Idle={idle_pct:.1f}%, Discharge={discharge_pct:.1f}%")
                             print(f"  Action range: [{warmup_actions['min_action']:.3f}, {warmup_actions['max_action']:.3f}] (span={action_range:.3f})")
-                            if action_range < 1.5:
+                            # Action space is [0, 1], so max range is 1.0. Warn if coverage is less than 80%
+                            if action_range < 0.8:
                                 print(f"  WARNING: Action space coverage may be insufficient!")
                             print()
                         

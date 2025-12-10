@@ -2,9 +2,9 @@
 
 This module defines the actor and twin critic networks used by the TD3
 algorithm. Both modules share an LSTM backbone (hidden size 64) followed by a
-two-layer multilayer perceptron (MLP) with ReLU activations. The actor maps
+two-layer multilayer perceptron (MLP) with ReLU activations.     The actor maps
 normalized environment states to actions shaped ``[batch, time, 1]`` in the
-``[-1, 1]`` interval (charge = negative, discharge = positive), while the
+``[0, 1]`` interval (interpreted based on peak windows: discharge in peaks, charge outside), while the
 critics return Q-value sequences of shape ``[batch, time, 1]`` for
 state-action pairs.
 """
@@ -43,7 +43,7 @@ class LSTMOutput:
 
 
 class ActorLSTM(nn.Module):
-    """LSTM-based actor that outputs continuous actions in ``[-1, 1]``.
+    """LSTM-based actor that outputs continuous actions in ``[0, 1]``.
 
     Args:
         state_dim: Number of input features per time step.
@@ -54,7 +54,7 @@ class ActorLSTM(nn.Module):
     Notes:
         The forward method accepts state sequences shaped ``[batch, time, F]``
         and returns an action sequence ``[batch, time, 1]`` (bounded to
-        ``[-1, 1]``). The LSTM processes the full sequence internally with
+        ``[0, 1]``). The LSTM processes the full sequence internally with
         hidden states reset at the start of each sequence.
     """
 
@@ -102,9 +102,9 @@ class ActorLSTM(nn.Module):
         lstm_out, hidden_out = self.lstm(state_seq, hidden)
         # Apply MLP to each time step
         features = self.backbone(lstm_out)
-        # Map to a single action value per time step, then squash to [-1, 1]
+        # Map to a single action value per time step, then squash to [0, 1]
         raw_action = self.head(features)
-        actions = torch.tanh(raw_action)  # shape [B,T,1], range [-1, 1]
+        actions = torch.sigmoid(raw_action)  # shape [B,T,1], range [0, 1]
         return actions, hidden_out
 
 

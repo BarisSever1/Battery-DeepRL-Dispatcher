@@ -47,8 +47,9 @@ def _run_plan(env: BESSEnv, plan: List[float]) -> EpisodeStats:
         "cost_degradation": 0.0,
     }
     final_info: Dict[str, float] = {}
-    for hour, delta in enumerate(plan):
-        action = np.array([float(np.clip(delta, -1.0, 1.0))], dtype=np.float32)
+    for hour, action_value in enumerate(plan):
+        # Plan is already in [0, 1] format
+        action = np.array([float(np.clip(action_value, 0.0, 1.0))], dtype=np.float32)
         _, reward, terminated, truncated, info = env.step(action)
         totals["return"] += reward
         totals["revenue_pv_grid"] += info.get("revenue_pv_grid", 0.0)
@@ -82,17 +83,21 @@ def pv_ds3_plan(env: BESSEnv, seed: int) -> List[float]:
 
 def pv_da_two_cycles_plan(env: BESSEnv, seed: int) -> List[float]:
     """
-    Two full cycles baseline:
+    Two full cycles baseline using [0, 1] action space:
     1. Start at 0.5 SOC
-    2. Charge fully in cheapest hours before morning peak
-    3. Discharge fully during morning peak window (peak-1 to peak+1)
-    4. Charge before evening peak in cheap hours
-    5. Discharge fully during evening peak window (peak-1 to peak+1)
-    6. Charge back to 0.5 by end of day
+    2. Charge fully in cheapest hours before morning peak (action=1 outside peak)
+    3. Discharge fully during morning peak window (peak-1 to peak+1, action=1 in peak)
+    4. Charge before evening peak in cheap hours (action=1 outside peak)
+    5. Discharge fully during evening peak window (peak-1 to peak+1, action=1 in peak)
+    Note: Does not charge back to 0.5 - ends at whatever SOC after evening discharge
+    
+    Returns actions in [0, 1] format where:
+    - In peak windows: 1 = discharge, 0 = idle
+    - Outside peak windows: 1 = charge, 0 = idle
     """
     del seed
     day_data = env.day_data.reset_index(drop=True)
-    plan = [0.0] * env.max_hours
+    plan = [0.0] * env.max_hours  # Default: idle (0.0)
     if day_data.empty:
         return plan
 
@@ -106,6 +111,15 @@ def pv_da_two_cycles_plan(env: BESSEnv, seed: int) -> List[float]:
 
     morning_peak = _clip_hour(morning_peak)
     evening_peak = _clip_hour(evening_peak)
+
+    # Use environment's peak windows (set during reset) to ensure consistency
+    morning_peak_hours = getattr(env, 'morning_peak_hours', set())
+    evening_peak_hours = getattr(env, 'evening_peak_hours', set())
+    all_peak_hours = morning_peak_hours | evening_peak_hours
+    
+    # Also keep the window sets for discharge logic
+    morning_peak_window = morning_peak_hours
+    evening_peak_window = evening_peak_hours
 
     # Find cheapest hours before morning peak (hours 0 to morning_peak-1)
     hours_before_morning = list(range(0, morning_peak))
@@ -126,38 +140,30 @@ def pv_da_two_cycles_plan(env: BESSEnv, seed: int) -> List[float]:
         cheapest_before_evening = [h for h, _ in prices_before_evening[:3]]
 
     # Phase 1: Charge fully in cheapest hours before morning peak
+    # Action = 1.0 if outside peak window (charge), 0.0 if in peak window
     for h in cheapest_before_morning:
-        plan[h] = -1.0  # Full charge
+        # Always charge in cheapest hours (they should be outside peak windows)
+        plan[h] = 1.0  # Charge (action=1 outside peak)
 
     # Phase 2: Discharge fully during morning peak window (peak-1 to peak+1)
-    morning_peak_window = [
-        h for h in range(max(0, morning_peak - 1), min(env.max_hours, morning_peak + 2))
-        if h not in cheapest_before_morning  # Don't discharge in hours we're charging
-    ]
+    # Action = 1.0 if in peak window (discharge), 0.0 if outside peak window
     for h in morning_peak_window:
-        plan[h] = 1.0  # Full discharge
+        if h not in cheapest_before_morning:  # Don't discharge in hours we're charging
+            plan[h] = 1.0  # Discharge (action=1 in peak)
 
     # Phase 3: Charge in cheapest hours before evening peak
+    # Action = 1.0 if outside peak window (charge), 0.0 if in peak window
     for h in cheapest_before_evening:
-        plan[h] = -1.0  # Full charge
+        # Always charge in cheapest hours (they should be outside peak windows)
+        plan[h] = 1.0  # Charge (action=1 outside peak)
 
     # Phase 4: Discharge fully during evening peak window (peak-1 to peak+1)
-    evening_peak_window = [
-        h for h in range(max(0, evening_peak - 1), min(env.max_hours, evening_peak + 2))
-        if h not in cheapest_before_evening  # Don't discharge in hours we're charging
-    ]
+    # Action = 1.0 if in peak window (discharge), 0.0 if outside peak window
     for h in evening_peak_window:
-        plan[h] = 1.0  # Full discharge
+        if h not in cheapest_before_evening:  # Don't discharge in hours we're charging
+            plan[h] = 1.0  # Discharge (action=1 in peak)
 
-    # Phase 5: Charge back to 0.5 from evening peak to end of day
-    # Calculate how much we need to charge back (from ~0.1 to 0.5 = 0.4 of capacity)
-    # With efficiency, we need to charge more: 0.4 / eta_ch
-    # But we'll just charge at moderate rate for remaining hours
-    for h in range(evening_peak + 1, env.max_hours):
-        # Charge moderately to reach 0.5 by end of day
-        # If we have ~6 hours left and need to go from 0.1 to 0.5, charge at ~0.4/6 = 0.067 per hour
-        # But with efficiency losses, we need more, so use -0.5 (half charge rate)
-        plan[h] = -0.5  # Moderate charge to reach 0.5
+    # No Phase 5: Do not charge back to 0.5 - let battery end at whatever SOC after evening discharge
 
     return plan
 
