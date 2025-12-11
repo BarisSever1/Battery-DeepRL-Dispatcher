@@ -398,6 +398,7 @@ def evaluate_baseline_comprehensive(
     plan_fn: Callable[[BESSEnv, int], List[float]],
     test_dates: List[str],
     seed: int = 999,
+    policy_name: str = "",
 ) -> Tuple[List[ComprehensiveStats], List[List[HourlyData]]]:
     """Evaluate baseline policy on test dates and return comprehensive statistics and hourly data."""
     stats_list: List[ComprehensiveStats] = []
@@ -460,7 +461,11 @@ def evaluate_baseline_comprehensive(
             # Update cumulative totals
             totals["revenue_pv"] += info.get("revenue_pv_grid", 0.0)
             totals["revenue_energy"] += info.get("revenue_energy", 0.0)
-            totals["revenue_reserve"] += info.get("revenue_reserve", 0.0)
+            # For PV+DA (Two Cycles) baseline, exclude reserve revenue (as if not participating)
+            if policy_name == "PV+DA (Two Cycles)":
+                totals["revenue_reserve"] += 0.0  # No reserve participation
+            else:
+                totals["revenue_reserve"] += info.get("revenue_reserve", 0.0)
             totals["degradation"] += info.get("cost_degradation", 0.0)
             cumulative_revenue = (
                 totals["revenue_pv"] + totals["revenue_energy"] + totals["revenue_reserve"]
@@ -471,6 +476,8 @@ def evaluate_baseline_comprehensive(
             reward = float(info.get("reward_shaping", info.get("reward", reward)))
 
             # Store comprehensive hourly data
+            # For PV+DA (Two Cycles) baseline, exclude reserve revenue
+            reserve_revenue = 0.0 if policy_name == "PV+DA (Two Cycles)" else float(info.get("revenue_reserve", 0.0))
             hourly_data.append(
                 HourlyData(
                     hour=hour,
@@ -490,7 +497,7 @@ def evaluate_baseline_comprehensive(
                     price_as=float(info.get("price_as", 0.0)),
                     revenue_pv=float(info.get("revenue_pv_grid", 0.0)),
                     revenue_energy=float(info.get("revenue_energy", 0.0)),
-                    revenue_reserve=float(info.get("revenue_reserve", 0.0)),
+                    revenue_reserve=reserve_revenue,
                     degradation_cost=float(info.get("cost_degradation", 0.0)),
                     reward=reward,
                     cumulative_revenue=cumulative_revenue,
@@ -802,7 +809,7 @@ def main() -> None:
 
     for name, plan_fn in baselines:
         print(f"\nEvaluating {name}...")
-        stats_list, hourly_list = evaluate_baseline_comprehensive(env, plan_fn, test_dates, args.seed)
+        stats_list, hourly_list = evaluate_baseline_comprehensive(env, plan_fn, test_dates, args.seed, policy_name=name)
         results[name] = stats_list
         hourly_results[name] = hourly_list
         print(f"[OK] Completed {len(stats_list)} episodes")

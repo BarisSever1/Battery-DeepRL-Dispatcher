@@ -24,18 +24,18 @@ class TD3Config:
     from a config file (YAML) when constructing the agent.
     """
 
-    gamma: float = 0.995
+    gamma: float = 1.0
     n_step: int = 1
     use_n_step: bool = True
     tau: float = 0.01  # Faster target updates to track policy changes better
     policy_delay: int = 2
-    lr: float = 7e-5
+    lr: float = 5e-5
     actor_lr: Optional[float] = None
     critic_lr: Optional[float] = None
     exploration_std: float = 0.5
     target_std: float = 0.5
     noise_clip: float = 0.4
-    action_low: float = -1.0
+    action_low: float = 0.0
     action_high: float = 1.0
 
 

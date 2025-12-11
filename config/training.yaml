@@ -2,14 +2,14 @@
 
 algorithm:
   name: TD3
-  gamma: 0.995        # discount factor (0.99 for stability, avoids exploding Q-values)
+  gamma: 1.0         
   n_step: 1           # n-step return horizon for faster credit assignment
   tau: 0.01              # Polyak (faster target updates to track policy changes better)
   policy_delay: 2         # delayed actor + target updates
   target_noise: 0.5       # target policy smoothing std (lower for bidirectional actions)
   noise_clip: 0.4
-  actor_lr: 7e-5
-  critic_lr: 7e-5  # Balanced learning rate for both networks
+  actor_lr: 5e-5
+  critic_lr: 5e-5  # Balanced learning rate for both networks
   optimizer: Adam
   normalize_reward: false  # rewards already in physical units
 
@@ -45,9 +45,9 @@ training:
 
 exploration:
   noise_type: Normal
-  initial_noise_std: 1.0    # High initial exploration noise
-  final_noise_std: 0.1      # Low final exploration noise
-  noise_decay_episodes: 2200  # Decay over 2000 episodes
+  initial_noise_std: 0.5    # Constant exploration noise (matches paper Table 3)
+  final_noise_std: 0.5      # Same as initial (no decay)
+  noise_decay_episodes: 0   # No decay - constant noise throughout training
 
 evaluation:
   eval_every_epochs: 1

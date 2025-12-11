@@ -80,12 +80,7 @@ class BESSEnv(gym.Env):
         self.degradation_model = degradation_model.lower().strip()
         # Target SOC for optional end-of-day shaping
         self.target_soc = 0.50  # default target
-        self.terminal_soc_penalty_eur = 3000.0  # € penalty per unit SOC deviation at day end
-        self.cycle_penalty_eur_per_cycle = 2500.0  # € penalty per extra full cycle beyond target
-        self.prepeak_morning_target_soc = 0.75
-        self.prepeak_evening_target_soc = 0.80
         self.target_daily_throughput_mwh = 2.0 * self.E_capacity
-        self.throughput_penalty_eur_per_mwh = 150.0
 
         # Define action and observation spaces
         # Action: a ∈ [0, 1] - in peak windows: 1 = discharge, 0 = idle; outside peaks: 1 = charge, 0 = idle
@@ -629,7 +624,9 @@ class BESSEnv(gym.Env):
             
             # Re-check reserve constraints with updated flows (activation-feasible headroom)
             # Reserve is capacity, not actual export, so check POI headroom for hypothetical activation
-            current_export = p_pv_grid + max(p_bess_em, 0.0)
+            # Use battery AC export (not EM flow) to compute activation headroom
+                        
+            current_export = p_pv_grid + max(p_battery, 0.0)
             poi_headroom = max(0.0, self.P_poi_max - current_export)
             p_reserve_feas = min(p_reserve_feas, poi_headroom)
 
@@ -659,7 +656,7 @@ class BESSEnv(gym.Env):
              - cost_degradation
         )
         
-        # Normalize reward by dividing by 700
+        # Normalize reward by dividing by 500
         reward = float(reward) / 500.0
         
         self.daily_throughput += abs(p_battery) * dt

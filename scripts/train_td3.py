@@ -36,10 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exploration-std", type=float, default=0.5, help="Std dev of exploration noise")
     parser.add_argument("--target-std", type=float, default=0.5, help="Std dev of target policy smoothing noise")
     parser.add_argument("--noise-clip", type=float, default=0.4, help="Clamp for target policy smoothing noise")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gamma", type=float, default=1, help="Discount factor")
     parser.add_argument("--tau", type=float, default=0.01, help="Polyak averaging factor (faster target updates to track policy changes)")
     parser.add_argument("--policy-delay", type=int, default=2, help="Delayed policy update interval")
-    parser.add_argument("--lr", type=float, default=7e-5, help="Learning rate for actor/critic")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for actor/critic")
     parser.add_argument("--actor-lr", type=float, default=None, help="Optional override for actor learning rate")
     parser.add_argument("--critic-lr", type=float, default=None, help="Optional override for critic learning rate")
     parser.add_argument("--device", type=str, default="auto", help="Training device: auto|cpu|cuda")
@@ -216,7 +216,9 @@ def _denorm_obs_features(env: BESSEnv, obs_vec: np.ndarray, soc_before: float) -
 def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float = 0.3) -> np.ndarray:
     """
     During warmup: mix rule-based hints (70%) with random actions (30%).
-    This ensures the agent sees both good behaviors and full action space coverage.
+    Updated for current 20-dim observation space and action interpretation:
+    - In peak windows: action = 1 → discharge, action = 0 → idle
+    - Outside peak windows: action = 1 → charge, action = 0 → idle
     
     Args:
         env: The BESS environment
@@ -224,17 +226,20 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         random_prob: Probability of using pure random action (default 0.3)
     
     Returns:
-        Action array of shape (1,)
+        Action array of shape (1,) in [0, 1]
     """
     if random.random() < random_prob:
         # 30% pure random to ensure full action space coverage
         return env.action_space.sample().astype(np.float32)
     
-    # 70% rule-based hints matching reward shaping
+    # 70% rule-based hints matching current action space
     try:
-        # Extract normalized features from observation
-        hour_norm = obs_vec[0]  # k (hour of day)
-        soc_norm = obs_vec[6]   # SOC
+        # Extract features from 20-dim observation vector
+        # Indices based on _get_observation() in env_pv_bess.py:
+        hour_norm = obs_vec[0]   # k (hour of day) - index 0
+        soc_norm = obs_vec[6]    # SOC - index 6
+        is_peak_hour = obs_vec[18]  # Binary indicator: 1.0 = peak, -1.0 = not peak - index 18
+        is_cheap_before_peak = obs_vec[19]  # Binary indicator: 1.0 = cheap, -1.0 = not cheap - index 19
         
         # Denormalize to get actual values
         hour = int(round(env._denormalize("k", hour_norm)))
@@ -242,46 +247,48 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         soc = env._denormalize("soc", soc_norm)
         soc = max(0.0, min(1.0, soc))  # Clamp to valid range
         
-        # Get peak hours and cheapest hours before peaks from environment
-        morning_peak_hours = getattr(env, "morning_peak_hours", set())
-        evening_peak_hours = getattr(env, "evening_peak_hours", set())
-        peak_hours = morning_peak_hours.union(evening_peak_hours)
-        cheapest_before_morning = getattr(env, "cheapest_before_morning", set())
-        cheapest_before_evening = getattr(env, "cheapest_before_evening", set())
+        # Get SOC limits
         soc_min = env.soc_min
         soc_max = env.soc_max
         
+        # Check if we're in a peak hour using the binary indicator
+        in_peak_window = (is_peak_hour > 0.0)  # 1.0 means peak hour
+        
+        # Check if we're in cheap hours before peak using the binary indicator
+        in_cheap_hours = (is_cheap_before_peak > 0.0)  # 1.0 means cheap before peak
+        
         # === 1) PEAK DISCHARGE (HIGHEST PRIORITY) ===
-        # Discharge in morning peak or evening peak
-        if hour in peak_hours:
+        # In peak windows: action = 1 → discharge, action = 0 → idle
+        if in_peak_window:
             if soc <= soc_min + 0.05:
-                # At min SOC - can't discharge, idle
+                # At min SOC - can't discharge, idle (action = 0)
                 action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
             elif soc > 0.3:
-                # Strong discharge during peak hours (matches reward shaping)
-                action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
+                # Strong discharge during peak hours (action near 1.0)
+                action = np.random.uniform(0.7, 1.0, size=(1,)).astype(np.float32)
             else:
                 # Low SOC but not at min - moderate discharge
-                action = np.random.uniform(0.2, 0.6, size=(1,)).astype(np.float32)
+                action = np.random.uniform(0.3, 0.7, size=(1,)).astype(np.float32)
         
         # === 2) CHARGE IN CHEAPEST HOURS BEFORE PEAKS ===
-        # Charge in 3 cheapest hours before morning peak or before evening peak
-        elif hour in cheapest_before_morning or hour in cheapest_before_evening:
+        # Outside peak windows: action = 1 → charge, action = 0 → idle
+        elif in_cheap_hours:
             if soc >= soc_max - 0.05:
-                # At max SOC - avoid charging (will be penalized), idle
+                # At max SOC - avoid charging, idle (action = 0)
                 action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
             else:
-                # Strong charging in cheapest hours before peaks (matches reward shaping)
-                action = np.random.uniform(0.5, 1.0, size=(1,)).astype(np.float32)
+                # Strong charging in cheapest hours before peaks (action near 1.0)
+                action = np.random.uniform(0.7, 1.0, size=(1,)).astype(np.float32)
         
         # === 3) IDLING / OTHER HOURS ===
         else:
-            # Other hours - idle (matches reward shaping: neutral/idle reward)
+            # Other hours - idle (action = 0)
             action = np.random.uniform(0.0, 0.1, size=(1,)).astype(np.float32)
         
         return action
-    except Exception:
+    except Exception as e:
         # Fallback to random if anything goes wrong
+        print(f"Warning: guided_warmup_action failed: {e}, using random action")
         return env.action_space.sample().astype(np.float32)
 
 
@@ -394,10 +401,10 @@ def main() -> None:
     train_cfg = (yaml_cfg.get("training") or {}) if isinstance(yaml_cfg, dict) else {}
     exploration_cfg = (yaml_cfg.get("exploration") or {}) if isinstance(yaml_cfg, dict) else {}
     
-    # Gaussian exploration decay parameters
-    initial_noise_std = float(exploration_cfg.get("initial_noise_std", 1.0)) if exploration_cfg else 1.0
-    final_noise_std = float(exploration_cfg.get("final_noise_std", 0.1)) if exploration_cfg else 0.1
-    noise_decay_episodes = int(exploration_cfg.get("noise_decay_episodes", 2000)) if exploration_cfg else 2000
+    # Gaussian exploration decay parameters (defaults match paper Table 3: constant 0.5)
+    initial_noise_std = float(exploration_cfg.get("initial_noise_std", 0.5)) if exploration_cfg else 0.5
+    final_noise_std = float(exploration_cfg.get("final_noise_std", 0.5)) if exploration_cfg else 0.5
+    noise_decay_episodes = int(exploration_cfg.get("noise_decay_episodes", 0)) if exploration_cfg else 0
 
     env = BESSEnv(data_path=args.data_path, degradation_model=args.degradation_model)
     env.action_space.seed(args.seed)
@@ -422,7 +429,7 @@ def main() -> None:
     actor_lr_val = float(algo_cfg.get("actor_lr", args.actor_lr if args.actor_lr is not None else args.lr))
     critic_lr_val = float(algo_cfg.get("critic_lr", args.critic_lr if args.critic_lr is not None else args.lr))
     # Use initial_noise_std for agent initialization (will be updated during training)
-    exploration_std_val = float(exploration_cfg.get("initial_noise_std", args.exploration_std)) if exploration_cfg else (args.exploration_std if args.exploration_std else 1.0)
+    exploration_std_val = float(exploration_cfg.get("initial_noise_std", args.exploration_std)) if exploration_cfg else (args.exploration_std if args.exploration_std else 0.5)
     target_std_val = float(algo_cfg.get("target_noise", args.target_std)) if algo_cfg else args.target_std
     noise_clip_val = float(algo_cfg.get("noise_clip", args.noise_clip)) if algo_cfg else args.noise_clip
 
@@ -494,6 +501,9 @@ def main() -> None:
     
     def get_noise_std(episode: int) -> float:
         """Calculate exploration noise std with linear decay."""
+        # If no decay (initial == final or decay_episodes == 0), return constant noise
+        if initial_noise_std == final_noise_std or noise_decay_episodes == 0:
+            return initial_noise_std
         if episode < args.warmup_steps // 24:  # During warmup, use high noise
             return initial_noise_std
         progress = min(1.0, max(0.0, (episode - args.warmup_steps // 24) / noise_decay_episodes))
