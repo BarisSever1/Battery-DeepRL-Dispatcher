@@ -57,7 +57,7 @@ features:
     column: res_gen_mw
     norm: minmax
     min: 0
-    max: 20          # match your POI/export cap
+    max: 15          # match your PV AC capacity
 
   - key: soc
     desc: Battery state of charge (0..1)

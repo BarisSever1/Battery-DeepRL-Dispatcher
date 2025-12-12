@@ -18,61 +18,61 @@ features:
     max: 3.0
     range: 3.0
   price_em:
-    min: -83.29
-    max: 247.35
-    range: 330.64
+    min: -34.53
+    max: 394.32
+    range: 428.85
   price_as:
-    min: 0.8
-    max: 13.81754183931486
-    range: 13.017541839314859
+    min: 0.0
+    max: 33.95165315857435
+    range: 33.95165315857435
   p_res_total:
     min: 0.0
-    max: 20.0
-    range: 20.0
+    max: 15.0
+    range: 15.0
   price_em_max_morning:
-    min: 5.19
-    max: 175.51
-    range: 170.32
+    min: 89.72
+    max: 280.06
+    range: 190.34
   price_em_max_evening:
-    min: 77.15
-    max: 247.35
-    range: 170.2
+    min: 145.63
+    max: 394.32
+    range: 248.69
   k_em_max_morning:
     min: 0.0
-    max: 11.0
-    range: 11.0
+    max: 9.0
+    range: 9.0
   k_em_max_evening:
     min: 16.0
     max: 21.0
     range: 5.0
   price_em_min:
-    min: -83.29
-    max: 85.81
-    range: 169.10000000000002
+    min: -34.53
+    max: 100.5
+    range: 135.03
   k_em_min:
-    min: 2.0
+    min: 1.0
     max: 23.0
-    range: 21.0
+    range: 22.0
   price_as_min:
-    min: 0.8
-    max: 1.1710745448672317
-    range: 0.3710745448672317
+    min: 0.0
+    max: 1.306973113148438
+    range: 1.306973113148438
   price_as_max:
-    min: 2.150756661127138
-    max: 13.81754183931486
-    range: 11.666785178187721
+    min: 3.355953679577381
+    max: 33.95165315857435
+    range: 30.59569947899697
   max_future_price_delta:
-    min: -95.84
-    max: 262.32
-    range: 358.15999999999997
+    min: -115.83
+    max: 301.87
+    range: 417.7
   avg_future_price_delta:
-    min: -142.915
-    max: 163.67999999999998
-    range: 306.59499999999997
+    min: -186.8475
+    max: 156.85875
+    range: 343.70624999999995
   peak_hour_price_delta:
     min: 0.0
-    max: 262.32
-    range: 262.32
+    max: 301.87
+    range: 301.87
   time_to_peak_hour:
     min: 0.0
     max: 21.0

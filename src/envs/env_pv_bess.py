@@ -80,7 +80,6 @@ class BESSEnv(gym.Env):
         self.degradation_model = degradation_model.lower().strip()
         # Target SOC for optional end-of-day shaping
         self.target_soc = 0.50  # default target
-        self.target_daily_throughput_mwh = 2.0 * self.E_capacity
 
         # Define action and observation spaces
         # Action: a ∈ [0, 1] - in peak windows: 1 = discharge, 0 = idle; outside peaks: 1 = charge, 0 = idle
@@ -144,8 +143,8 @@ class BESSEnv(gym.Env):
         
         # Battery parameters
         bess = config['bess']
-        self.P_bess_max = bess['power_rating_mw']  # 20 MW
-        self.E_capacity = bess['energy_capacity_mwh']  # 60 MWh
+        self.P_bess_max = bess['power_rating_mw']  # 1.5 MW
+        self.E_capacity = bess['energy_capacity_mwh']  # 3.5 MWh
         self.soc_min = bess['soc_min']  # 0.10
         self.soc_max = bess['soc_max']  # 0.90
         self.eta_charge = bess.get('charge_efficiency', 0.97)  # 0.97
@@ -154,13 +153,13 @@ class BESSEnv(gym.Env):
         
         # RES parameters
         res = config['res']
-        self.P_res_max = res.get('pv_ac_capacity_mw', res.get('pv_capacity_mw', 20.0))  # 20 MW
+        self.P_res_max = res.get('pv_ac_capacity_mw', res.get('pv_capacity_mw', 15.0))  # 15 MW
         
         # Grid/POI limits
         grid = config['grid']
-        self.P_poi_max = grid['poi_power_limit_mw']  # 20 MW
+        self.P_poi_max = grid['poi_power_limit_mw']  # 16.5 MW
         self.allow_grid_import = grid['allow_grid_import']  # True
-        self.P_import_max = grid.get('max_grid_import_mw', 20.0)  # 20 MW
+        self.P_import_max = grid.get('max_grid_import_mw', 1.5)  # 1.5 MW
         
         # Converter/inverter nominal ratings and efficiency aliases (paper naming)
         self.P_conv_nom = self.P_bess_max
@@ -567,6 +566,7 @@ class BESSEnv(gym.Env):
         price_em = self._denormalize('price_em', row['price_em'])      # €/MWh (energy market)
         price_as = self._denormalize('price_as', row['price_as'])      # €/MW·h (reserve)
         p_pv_t   = self._denormalize('p_res_total', row['p_res_total'])  # MW raw PV
+        p_pv_t   = min(p_pv_t, self.P_res_max)  # Clip to PV AC capacity (15 MW)
 
         dt = self.dt
         Emax = self.E_capacity
@@ -656,8 +656,8 @@ class BESSEnv(gym.Env):
              - cost_degradation
         )
         
-        # Normalize reward by dividing by 500
-        reward = float(reward) / 500.0
+        # Normalize reward by dividing by 200
+        reward = float(reward) / 200.0
         
         self.daily_throughput += abs(p_battery) * dt
 

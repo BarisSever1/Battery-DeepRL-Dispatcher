@@ -8,10 +8,10 @@
 
 bess:
   # Power rating of the battery converter (MW)
-  power_rating_mw: 20.0
+  power_rating_mw: 1.5
   
   # Usable energy capacity (MWh) - typically 80-90% of total capacity
-  energy_capacity_mwh: 60.0
+  energy_capacity_mwh: 3.5
 
   
   # State of Charge limits (fraction of usable capacity)
@@ -31,7 +31,7 @@ bess:
   
   
   # Storage duration (hours) - how long battery can run at full power
-  storage_duration_hours: 3.0
+  storage_duration_hours: 2.33
 
 # ============================================================================
 # Renewable Energy Source (RES) Specifications
@@ -39,10 +39,10 @@ bess:
 
 res:
   # Solar PV capacity (MW) - AC capacity
-  pv_ac_capacity_mw: 20.0
+  pv_ac_capacity_mw: 15.0
   
   # Solar PV DC capacity (MW)
-  pv_dc_capacity_mw: 45.64
+  pv_dc_capacity_mw: 34.2
   
   # DC/AC ratio
   dc_ac_ratio: 2.28
@@ -67,10 +67,10 @@ res:
 
 grid:
   # Point of Interconnection (POI) power limit (MW)
-  poi_power_limit_mw: 20.0
+  poi_power_limit_mw: 16.5
   
   # Inverter total rating (MW) - must be >= max(PV + BESS)
-  total_inverter_rating_mw: 48.0
+  total_inverter_rating_mw: 17.0
   
   # Grid import allowed (boolean)
   # True: BESS can charge from grid
@@ -78,7 +78,7 @@ grid:
   allow_grid_import: true
   
   # Maximum grid import power (MW) - only if allow_grid_import is true
-  max_grid_import_mw: 20.0
+  max_grid_import_mw: 1.5
 
 
 # ============================================================================

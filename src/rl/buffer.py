@@ -53,7 +53,7 @@ class ReplayBuffer:
         capacity: int = 200_000,
         dtype: np.dtype = np.float32,
         n_step: int = 1,
-        gamma: float = 0.995,
+        gamma: float = 1,
     ) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be a positive integer")

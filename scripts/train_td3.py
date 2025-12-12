@@ -244,7 +244,8 @@ def guided_warmup_action(env: BESSEnv, obs_vec: np.ndarray, random_prob: float =
         # Denormalize to get actual values
         hour = int(round(env._denormalize("k", hour_norm)))
         hour = max(0, min(23, hour))  # Clamp to valid range
-        soc = env._denormalize("soc", soc_norm)
+        # SOC normalization: normalized = 2.0 * soc - 1.0, so denormalize: soc = (normalized + 1.0) / 2.0
+        soc = (soc_norm + 1.0) / 2.0
         soc = max(0.0, min(1.0, soc))  # Clamp to valid range
         
         # Get SOC limits
