@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
+from src.baselines.energiaborze_data import get_energiaborze_hourly_data
 from src.envs import BESSEnv
 
 
@@ -168,6 +170,111 @@ def pv_da_two_cycles_plan(env: BESSEnv, seed: int) -> List[float]:
     return plan
 
 
+def energiaborze_plan(env: BESSEnv, seed: int) -> List[float]:
+    """
+    Energiabőrze policy: Loads discharge/charge data from Excel file and converts
+    to action plan matching the exact behavior without peak window logic.
+    
+    The Excel file contains 15-minute resolution data that is aggregated to hourly.
+    MW values are directly converted to action values:
+    - If discharging: action = discharge_MW / P_bess_max (normalized to [0, 1])
+    - If charging: action = charge_MW / P_bess_max (normalized to [0, 1])
+    
+    The environment will interpret actions based on peak windows automatically.
+    This policy directly maps the aggregator's discharge/charge behavior.
+    """
+    del seed
+    
+    # Default plan: all zeros (idle)
+    plan = [0.0] * env.max_hours
+    
+    # Get date from environment
+    if env.day_data.empty:
+        return plan
+    
+    # Extract date - could be in day_data or from current_day attribute
+    date_str = None
+    try:
+        date_obj = env.day_data.iloc[0]['date']
+        # Handle date objects (from datetime.date)
+        if hasattr(date_obj, 'strftime'):
+            date_str = date_obj.strftime('%Y-%m-%d')
+        elif isinstance(date_obj, str):
+            date_str = date_obj
+        else:
+            # Try to convert to string and parse
+            date_str = str(date_obj)
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+    except (KeyError, AttributeError, IndexError):
+        pass
+    
+    # Fallback to current_day attribute if available
+    if date_str is None and hasattr(env, 'current_day'):
+        date_obj = env.current_day
+        if hasattr(date_obj, 'strftime'):
+            date_str = date_obj.strftime('%Y-%m-%d')
+        elif isinstance(date_obj, str):
+            date_str = date_obj
+        else:
+            date_str = str(date_obj)
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+    
+    if date_str is None:
+        return plan
+    
+    # Ensure date is in YYYY-MM-DD format
+    if len(date_str) > 10:
+        date_str = date_str[:10]
+    
+    # Path to Excel file
+    excel_path = Path(__file__).parent.parent.parent / "data" / "raw" / "Gyongoshalasz Energiabörze-10.xlsx"
+    
+    if not excel_path.exists():
+        print(f"Warning: Energiabőrze Excel file not found at {excel_path}, using idle policy")
+        return plan
+    
+    # Get hourly data for this date
+    hourly_data = get_energiaborze_hourly_data(excel_path, date_str)
+    
+    if not hourly_data:
+        print(f"Warning: No Energiabőrze data found for date {date_str}, using idle policy")
+        return plan
+    
+    # Get battery max power
+    P_bess_max = getattr(env, 'P_bess_max', 1.5)  # Default 1.5 MW
+    
+    # Convert MW values to actions for each hour
+    # Directly map discharge/charge behavior: 0-1 for discharge, 0-1 for charge
+    # The environment will interpret based on peak windows automatically
+    for hour in range(env.max_hours):
+        if hour not in hourly_data:
+            plan[hour] = 0.0  # Missing hour: idle
+            continue
+        
+        discharge_mw = hourly_data[hour].get('discharge', 0.0)
+        charge_mw = hourly_data[hour].get('charge', 0.0)
+        
+        # Direct mapping: if discharging, use discharge value; if charging, use charge value
+        # Action space is [0, 1], so we normalize by P_bess_max
+        if discharge_mw > 0.0:
+            # Discharging: action = discharge_MW / P_bess_max (normalized to [0, 1])
+            action_value = discharge_mw / P_bess_max
+            plan[hour] = float(np.clip(action_value, 0.0, 1.0))
+        elif charge_mw > 0.0:
+            # Charging: action = charge_MW / P_bess_max (normalized to [0, 1])
+            # Note: Environment interprets action=1 outside peak as charge, action=1 in peak as discharge
+            # This directly maps the aggregator's charge behavior
+            action_value = charge_mw / P_bess_max
+            plan[hour] = float(np.clip(action_value, 0.0, 1.0))
+        else:
+            # Both zero: idle
+            plan[hour] = 0.0
+    
+    return plan
+
+
 def evaluate_policy(env: BESSEnv, name: str, plan_fn, seeds: List[int]) -> Dict[str, float]:
     stats: List[EpisodeStats] = []
     for seed in seeds:
@@ -199,6 +306,7 @@ __all__ = [
     "evaluate_policy",
     "pv_ds3_plan",
     "pv_da_two_cycles_plan",
+    "energiaborze_plan",
 ]
 
 

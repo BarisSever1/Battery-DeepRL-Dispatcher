@@ -21,7 +21,7 @@ plt.rcParams['ytick.labelsize'] = 10
 plt.rcParams['legend.fontsize'] = 11
 
 
-def plot_soc_and_prices(hourly_csv_path: str, output_path: Path, season_name: str = None):
+def plot_soc_and_prices(hourly_csv_path: str, output_path: Path, season_name: str = None, policy: str = "Energiabőrze"):
     """
     Plot SOC, day-ahead energy prices, and reserve prices over 24 hours.
     
@@ -29,8 +29,71 @@ def plot_soc_and_prices(hourly_csv_path: str, output_path: Path, season_name: st
         hourly_csv_path: Path to hourly CSV file
         output_path: Where to save the plot
         season_name: Optional season name for title
+        policy: Optional policy name to compare (default: "Energiabőrze"). 
+                If provided, loads from eval_td3_energiaborze/hourly_data.csv and adds as second SOC line.
     """
     df = pd.read_csv(hourly_csv_path)
+    
+    # Load policy comparison data if requested
+    df_policy = None
+    policy_soc = None
+    if policy:
+        try:
+            eval_csv = Path("results/eval_td3_energiaborze/hourly_data.csv")
+            if eval_csv.exists():
+                df_eval = pd.read_csv(eval_csv)
+                
+                # Find matching date - try different date column names
+                date_col = None
+                if 'test_day' in df.columns:
+                    date_col = 'test_day'
+                    main_date = df[date_col].iloc[0]
+                elif 'eval_date' in df.columns:
+                    date_col = 'eval_date'
+                    main_date = df[date_col].iloc[0]
+                elif 'date' in df.columns:
+                    date_col = 'date'
+                    main_date = df[date_col].iloc[0]
+                else:
+                    print(f"Warning: Could not find date column in main CSV. Skipping policy comparison.")
+                    policy = None
+                
+                if policy and date_col:
+                    # Match policy name (case-insensitive, handle variations)
+                    policy_name = None
+                    for p in df_eval['policy'].unique():
+                        if policy.lower() in p.lower() or p.lower() in policy.lower():
+                            policy_name = p
+                            break
+                    
+                    if policy_name:
+                        # Filter for matching date and policy
+                        df_policy = df_eval[
+                            (df_eval['test_day'] == main_date) & 
+                            (df_eval['policy'] == policy_name)
+                        ].copy()
+                        
+                        if len(df_policy) > 0:
+                            df_policy = df_policy.sort_values('hour').reset_index(drop=True)
+                            if 'soc_before' in df_policy.columns:
+                                policy_soc = df_policy['soc_before'].values * 100
+                            elif 'soc_raw' in df_policy.columns:
+                                policy_soc = df_policy['soc_raw'].values * 100
+                            else:
+                                print(f"Warning: Could not find SOC column in policy data. Skipping policy comparison.")
+                                policy = None
+                        else:
+                            print(f"Warning: No data found for policy '{policy_name}' on date {main_date}. Skipping policy comparison.")
+                            policy = None
+                    else:
+                        print(f"Warning: Policy '{policy}' not found in evaluation results. Available policies: {df_eval['policy'].unique()}")
+                        policy = None
+            else:
+                print(f"Warning: Evaluation results CSV not found at {eval_csv}. Skipping policy comparison.")
+                policy = None
+        except Exception as e:
+            print(f"Warning: Error loading policy comparison data: {e}. Skipping policy comparison.")
+            policy = None
     
     # Filter by season if specified
     if season_name and 'season_name' in df.columns:
@@ -78,6 +141,14 @@ def plot_soc_and_prices(hourly_csv_path: str, output_path: Path, season_name: st
     ax1.set_ylabel('State of Charge (%)', fontsize=13, fontweight='bold', color=color_soc)
     ax1.plot(hours, soc, color=color_soc, linewidth=3, marker='o', 
              markersize=6, label='Battery SOC', zorder=3)
+    
+    # Add policy comparison line if available
+    if policy and policy_soc is not None and len(policy_soc) == len(hours):
+        color_policy = '#e74c3c'  # Red
+        policy_label = policy  # Use policy name as-is (already correct for "Energiabőrze")
+        ax1.plot(hours, policy_soc, color=color_policy, linewidth=3, marker='s', 
+                 markersize=6, label=f'{policy_label} SOC', linestyle='--', zorder=3)
+    
     ax1.tick_params(axis='y', labelcolor=color_soc)
     ax1.set_ylim(0, 100)
     ax1.grid(True, alpha=0.3, linestyle='--', axis='both')
@@ -176,9 +247,14 @@ def main():
     parser.add_argument("--season", type=str, default=None,
                        choices=['winter', 'spring', 'summer', 'fall'],
                        help="Filter by season (optional)")
+    parser.add_argument("--policy", type=str, default="Energiabőrze",
+                       help="Policy name to compare (default: 'Energiabőrze'). Set to empty string to disable.")
     args = parser.parse_args()
     
-    plot_soc_and_prices(args.hourly_csv, args.output, args.season)
+    # Convert empty string to None to disable policy comparison
+    policy_arg = args.policy if args.policy else None
+    
+    plot_soc_and_prices(args.hourly_csv, args.output, args.season, policy_arg)
 
 
 if __name__ == "__main__":

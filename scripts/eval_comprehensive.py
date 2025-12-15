@@ -17,6 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.baselines.policies import (
+    energiaborze_plan,
     pv_da_two_cycles_plan,
     pv_ds3_plan,
 )
@@ -805,6 +806,7 @@ def main() -> None:
     baselines = [
         ("PV+DS3 (Reserve Only)", pv_ds3_plan),
         ("PV+DA (Two Cycles)", pv_da_two_cycles_plan),
+        ("Energiabőrze", energiaborze_plan),
     ]
 
     for name, plan_fn in baselines:
