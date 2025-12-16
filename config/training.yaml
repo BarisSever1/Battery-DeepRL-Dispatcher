@@ -11,7 +11,6 @@ algorithm:
   actor_lr: 5e-5
   critic_lr: 5e-5  # Balanced learning rate for both networks
   optimizer: Adam
-  normalize_reward: false  # rewards already in physical units
 
 networks:
   actor:
@@ -38,10 +37,10 @@ training:
   train_every_steps: 1        # critic updates each step
   # actor/target update cadence governed by policy_delay (no separate target_update_freq)
   max_grad_norm: 1.0
-  lr_schedule:
-    type: step
-    decay_factor: 0.5
-    decay_epochs: 50
+  # lr_schedule:  # Disabled - using fixed LR to match original TD3 paper
+  #   type: step
+  #   decay_factor: 0.5
+  #   decay_epochs: 50
 
 exploration:
   noise_type: Normal
