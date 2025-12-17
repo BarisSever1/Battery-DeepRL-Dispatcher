@@ -27,8 +27,8 @@ features:
     range: 33.95165315857435
   p_res_total:
     min: 0.0
-    max: 15.0
-    range: 15.0
+    max: 15.085806
+    range: 15.085806
   price_em_max_morning:
     min: 89.72
     max: 280.06
