@@ -1,0 +1,46 @@
+{
+  "TD3 (Nonlinear)": {
+    "mean_profit": 4316.703091277793,
+    "mean_revenue": 4449.1520242621455,
+    "mean_degradation": 132.44893298435176,
+    "mean_soc_min": 0.09999999999999999,
+    "mean_soc_max": 0.8999999994830411,
+    "mean_soc_final": 0.10132288359245202,
+    "mean_dod_max": 0.7999999994830409,
+    "mean_throughput_mwh": 8.82594977005067,
+    "mean_cycles": 1.5760624597391875
+  },
+  "PV+DS3 (Reserve Only)": {
+    "mean_profit": 4005.2633417791453,
+    "mean_revenue": 4005.2633417791453,
+    "mean_degradation": 0.0,
+    "mean_soc_min": 0.5,
+    "mean_soc_max": 0.5,
+    "mean_soc_final": 0.5,
+    "mean_dod_max": 0.0,
+    "mean_throughput_mwh": 0.0,
+    "mean_cycles": 0.0
+  },
+  "PV+DA (Two Cycles)": {
+    "mean_profit": 4341.702179643579,
+    "mean_revenue": 4481.547466060031,
+    "mean_degradation": 139.84528641645187,
+    "mean_soc_min": 0.09999999999999999,
+    "mean_soc_max": 0.8998775142857144,
+    "mean_soc_final": 0.09999999999999999,
+    "mean_dod_max": 0.7998775142857143,
+    "mean_throughput_mwh": 8.9023013790378,
+    "mean_cycles": 1.5898936642503727
+  },
+  "Energiab\u0151rze": {
+    "mean_profit": 4069.5905703972567,
+    "mean_revenue": 4075.3519729067634,
+    "mean_degradation": 5.76140250950682,
+    "mean_soc_min": 0.46227292453251384,
+    "mean_soc_max": 0.5666666411683053,
+    "mean_soc_final": 0.4631043530950376,
+    "mean_dod_max": 0.10439371663579149,
+    "mean_throughput_mwh": 0.6007855807893144,
+    "mean_cycles": 0.13702375057808308
+  }
+}
