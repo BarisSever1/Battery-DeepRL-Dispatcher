@@ -1,3 +1,0 @@
-﻿Changes in env_pv_bess.py since last training:
-- Added next-peak inventory valuation: SOC changes now reward holding energy when upcoming peaks are priced higher than the current hour.
-- Added peak-hold penalty: discharging within 2 hours of the next peak now incurs an opportunity-cost penalty based on the price gap.

@@ -1,7 +1,0 @@
-Changes before td3_monday4 training:
-- Observation vector expanded to 21 dims by adding 6h price trend, deltas to next morning/evening peaks, prior-step SOC, and a post-evening placeholder for time-to-peak so future-aware planning signals are visible to actor/critic, buffer, and eval.
-- Reward shaping rebuilt into clear components: inventory/opportunity-cost core, peak discharge bonus (base + per-MW scaled by price premium), off-peak discharge penalty, cheap-hour charge bonus, expensive-charge penalty, and strong SOC penalties/bonuses before and after peaks.
-- Disabled day-scale reward normalization so shaping terms flow into the critic unchanged.
-- Reward signal now uses only the shaping components (inventory, SOC targets, bonuses/penalties); raw revenue/degradation economics are excluded from the critic target.
-- Next-peak valuation now pins the target price to the day's max after the final evening peak, preventing late dumps and reinforcing overnight hold behavior.
-

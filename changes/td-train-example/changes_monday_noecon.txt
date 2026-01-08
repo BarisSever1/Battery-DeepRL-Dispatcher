@@ -1,5 +1,0 @@
-Changes before td3_monday_noecon2 training:
-- Disabled economic reward component; critic now optimizes only the shaping terms (inventory, peak bonuses, SOC incentives).
-- All SOC-related incentives are action-based: pre-peak charging/descharging rewards/penalties and post-peak discharge/charge penalties scale with current power so gradients depend on the taken action.
-- Future-aware price deltas and reward breakdown columns (base vs shaping vs final) are logged into quick/eval CSVs for diagnosis.
-

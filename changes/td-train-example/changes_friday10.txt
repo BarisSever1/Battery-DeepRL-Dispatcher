@@ -1,3 +1,0 @@
-﻿Changes before td3_friday10 training:
-- Post-peak bonus now grants a base reward (0.3 morning / 0.4 evening / 0.2 other peaks) plus 0.3Ă—action_fraction, so any positive discharge gets a boost.
-- If SOC > min+5% and the agent fails to discharge during a peak (or charges), it takes a -0.25 penalty to discourage idling through peaks.

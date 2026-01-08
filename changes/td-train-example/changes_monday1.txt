@@ -1,3 +1,0 @@
-﻿Changes before td3_monday1 training:
-- Increased all peak/cheap/PV bonus weights and off-peak penalties so rewards include both a fixed base component and a stronger proportional term.
-- Added a penalty when SOC is available but the agent fails to discharge during peaks (applies post-normalization alongside the base bonus).

@@ -1,3 +1,0 @@
-﻿Changes before td3_friday8 training:
-- Restored raw degradation cost (removed previous 0.4 scaling factor) so economics reflect full wear.
-- Added peak_reward_norm term: discharging during peak hours now adds an extra normalized reward (0.3 * price premium * action fraction) even after normalization.
